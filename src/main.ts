@@ -1,7 +1,9 @@
-export function main(): void {
-  console.log("hello");
+import { runQcontrol } from "./qcontrol";
+
+export async function main(args = process.argv.slice(2)): Promise<number> {
+  return runQcontrol({ args });
 }
 
 if (import.meta.main) {
-  main();
+  process.exitCode = await main();
 }
