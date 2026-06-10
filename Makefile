@@ -4,6 +4,8 @@ BIN_DIR := bin
 BINARY := qctl
 QCONTROL_BIN := vendor/qcontrol.bin
 
+.DEFAULT_GOAL := build
+
 .PHONY: dev build qcontrol clean
 
 build: qcontrol
