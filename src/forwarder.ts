@@ -4,14 +4,29 @@
  * and resolves installation/process dependencies for downstream consumers.
  */
 
-/** Represents a parsed qcontrol event whose concrete schema is owned upstream. */
-export type QcontrolEvent = Record<string, unknown>;
+import type { RunRecord } from "./types/qcontrol-run";
+import type { InstallationRecord, ProcessStarted, ScanEvent } from "./types/qcontrol-scan";
+
+/** Represents a parsed qcontrol sink record from either a run or a scan. */
+export type QcontrolEvent = RunRecord | ScanEvent;
 
 /** Represents an installation payload emitted by an installation discovery event. */
-export type QcontrolInstallation = Record<string, unknown>;
+export type QcontrolInstallation = InstallationRecord;
 
 /** Represents a process payload emitted by a process start event. */
-export type QcontrolProcess = Record<string, unknown>;
+export type QcontrolProcess = ProcessStarted & {
+  /** Globally unique process identifier added by the collector. */
+  entity_id: string;
+};
+
+/**
+ * Describes the shape ConsoleForwarder prints: the event with its resolved
+ * context embedded, minus whichever record the payload itself already is.
+ */
+export type ConsoleEvent = QcontrolEvent & {
+  installation?: QcontrolInstallation;
+  process?: QcontrolProcess;
+};
 
 /**
  * Receives one parsed qcontrol event plus any dependency records the collector
@@ -47,10 +62,12 @@ export class ConsoleForwarder implements Forwarder {
     installation?: QcontrolInstallation,
     process?: QcontrolProcess,
   ): void {
-    console.log(JSON.stringify({
+    const record: ConsoleEvent = {
       ...event,
       ...(installation && this.shouldInjectInstallation(event) ? { installation } : {}),
       ...(process && this.shouldInjectProcess(event) ? { process } : {}),
-    }));
+    };
+
+    console.log(JSON.stringify(record));
   }
 }
