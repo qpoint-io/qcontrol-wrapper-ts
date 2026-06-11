@@ -2,8 +2,57 @@
  * Provides the qctl command entry point and routes wrapper-owned commands before
  * falling through to the embedded qcontrol binary.
  */
+import { Collector } from "./collector";
+import { ConsoleForwarder } from "./forwarder";
 import { install, uninstall } from "./installation";
 import { runQcontrol } from "./qcontrol";
+import { Scanner } from "./scanner";
+
+/**
+ * Starts qctl's local event pipeline by binding the collector socket before the
+ * scanner begins emitting qcontrol events into that sink.
+ */
+export async function start(): Promise<number> {
+  const forwarder = new ConsoleForwarder();
+  const collector = new Collector({ forwarders: [forwarder] });
+  const scanner = new Scanner();
+
+  await collector.start();
+
+  try {
+    const child = await scanner.start();
+    let stopPromise: Promise<void> | undefined;
+
+    const stopRuntime = (): Promise<void> => {
+      stopPromise ??= (async () => {
+        await scanner.stop();
+        await collector.stop();
+      })();
+
+      return stopPromise;
+    };
+
+    const handleSignal = () => {
+      // Signals should stop the child first so the socket remains available for
+      // final events until qcontrol has exited.
+      void stopRuntime();
+    };
+
+    process.once("SIGINT", handleSignal);
+    process.once("SIGTERM", handleSignal);
+
+    try {
+      return await child.exited;
+    } finally {
+      process.off("SIGINT", handleSignal);
+      process.off("SIGTERM", handleSignal);
+      await stopRuntime();
+    }
+  } catch (error) {
+    await collector.stop();
+    throw error;
+  }
+}
 
 /**
  * Dispatches CLI arguments to qctl lifecycle helpers or forwards unknown
@@ -16,6 +65,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     case "uninstall":
       return uninstall();
     case "start":
+      return start();
     case "stop":
       console.log(`${args[0]} not yet implemented`);
       return 0;
