@@ -1,23 +1,232 @@
 /**
- * Owns qctl installation helpers that initialize qcontrol and wire qctl's run
- * event socket sink into the user's qcontrol configuration.
+ * Owns qctl installation helpers that initialize qcontrol, register launchd's
+ * privileged daemon job, and wire qctl's run event socket sink into qcontrol.
  */
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { runQcontrolAsRoot } from "./qcontrol";
 
 const QCTL_SINK_MARKER = "# qctl run-event socket sink";
+const QCTL_CONFIG_DIR_ENV = "QCTL_CONFIG_DIR";
+const QCTL_SOCKET_PATH_ENV = "QCTL_SOCKET_PATH";
+const LAUNCH_DAEMON_LABEL = "com.qpoint.qctl";
+const LAUNCH_DAEMON_PATH = `/Library/LaunchDaemons/${LAUNCH_DAEMON_LABEL}.plist`;
+const LAUNCH_DAEMON_TARGET = `system/${LAUNCH_DAEMON_LABEL}`;
+const LAUNCHD_LOG_DIR = "/Library/Logs/qctl";
+const RUNTIME_SOCKET_DIR = "/var/run/qctl";
 
 /** Resolves the qcontrol configuration directory using qcontrol's XDG layout. */
 function defaultQcontrolConfigDir(): string {
+  if (process.env[QCTL_CONFIG_DIR_ENV]) {
+    return process.env[QCTL_CONFIG_DIR_ENV];
+  }
+
   if (process.env.XDG_CONFIG_HOME) {
     return join(process.env.XDG_CONFIG_HOME, "qcontrol");
   }
 
   return join(homedir(), ".config", "qcontrol");
+}
+
+/** Identifies the user whose qcontrol config receives qctl's socket sink hook. */
+function currentUserId(): number {
+  return process.getuid?.() ?? 0;
+}
+
+/** Returns the historic config-local socket path so uninstall can migrate it out. */
+function legacyQctlSocketPath(): string {
+  return join(defaultQcontrolConfigDir(), "qctl.sock");
+}
+
+/** Resolves qctl's runtime socket outside persistent qcontrol configuration. */
+function defaultQctlSocketPath(): string {
+  if (process.env[QCTL_SOCKET_PATH_ENV]) {
+    return process.env[QCTL_SOCKET_PATH_ENV];
+  }
+
+  return join(RUNTIME_SOCKET_DIR, `${currentUserId()}.sock`);
+}
+
+/** Escapes launchd plist string values without taking a dependency on plist IO. */
+function escapePlistString(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+/**
+ * Resolves the binary launchd should execute, refusing script-mode installs that
+ * would point a system daemon at Bun instead of the compiled qctl wrapper.
+ */
+function getQctlExecutablePath(): string {
+  const configuredPath = process.env.QCTL_EXECUTABLE;
+  if (configuredPath) {
+    return resolve(configuredPath);
+  }
+
+  if (basename(process.execPath) === "bun") {
+    throw new Error(
+      "qctl install must run from the compiled qctl binary, or QCTL_EXECUTABLE must point to it",
+    );
+  }
+
+  return resolve(process.execPath);
+}
+
+/** Builds the root LaunchDaemon plist that runs qctl's daemon command in place. */
+function buildLaunchDaemonPlist(): string {
+  const configDir = defaultQcontrolConfigDir();
+  const values = {
+    executable: escapePlistString(getQctlExecutablePath()),
+    configDir: escapePlistString(configDir),
+    socketPath: escapePlistString(getQctlSocketPath()),
+    xdgConfigHome: escapePlistString(dirname(configDir)),
+    stdoutPath: escapePlistString(join(LAUNCHD_LOG_DIR, "stdout.log")),
+    stderrPath: escapePlistString(join(LAUNCHD_LOG_DIR, "stderr.log")),
+  };
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCH_DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${values.executable}</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>${QCTL_CONFIG_DIR_ENV}</key>
+    <string>${values.configDir}</string>
+    <key>${QCTL_SOCKET_PATH_ENV}</key>
+    <string>${values.socketPath}</string>
+    <key>XDG_CONFIG_HOME</key>
+    <string>${values.xdgConfigHome}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${values.stdoutPath}</string>
+  <key>StandardErrorPath</key>
+  <string>${values.stderrPath}</string>
+</dict>
+</plist>
+`;
+}
+
+/** Runs a child process with inherited stdio so sudo and launchctl remain usable. */
+async function runCommand(
+  command: string[],
+  stdio: Bun.SpawnOptions.Readable = "inherit",
+): Promise<number> {
+  return Bun.spawn({
+    cmd: command,
+    stdin: "inherit",
+    stdout: stdio,
+    stderr: stdio,
+  }).exited;
+}
+
+/** Runs a command through sudo, preserving interactive password prompts. */
+function runAsRoot(
+  command: string[],
+  stdio?: Bun.SpawnOptions.Readable,
+): Promise<number> {
+  return runCommand(["sudo", "--", ...command], stdio);
+}
+
+/** Detects whether launchd already has qctl's system daemon in its bootstrap set. */
+async function isLaunchDaemonLoaded(): Promise<boolean> {
+  return (
+    (await runCommand(
+      ["launchctl", "print", LAUNCH_DAEMON_TARGET],
+      "ignore",
+    )) === 0
+  );
+}
+
+/** Installs the root-owned launchd plist without leaving user-writable service files. */
+async function installLaunchDaemon(plist: string): Promise<number> {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "qctl-launchd-"));
+  const temporaryPlist = join(
+    temporaryDirectory,
+    `${LAUNCH_DAEMON_LABEL}.plist`,
+  );
+
+  try {
+    await writeFile(temporaryPlist, plist, { mode: 0o644 });
+
+    let exitCode = await runAsRoot([
+      "/usr/bin/install",
+      "-d",
+      "-o",
+      "root",
+      "-g",
+      "wheel",
+      "-m",
+      "755",
+      dirname(LAUNCH_DAEMON_PATH),
+      LAUNCHD_LOG_DIR,
+      RUNTIME_SOCKET_DIR,
+    ]);
+    if (exitCode !== 0) {
+      return exitCode;
+    }
+
+    exitCode = await runAsRoot([
+      "/usr/bin/install",
+      "-o",
+      "root",
+      "-g",
+      "wheel",
+      "-m",
+      "644",
+      temporaryPlist,
+      LAUNCH_DAEMON_PATH,
+    ]);
+    if (exitCode !== 0) {
+      return exitCode;
+    }
+
+    return 0;
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+/** Removes the LaunchDaemon plist after ensuring launchd no longer owns the job. */
+async function removeLaunchDaemon(): Promise<number> {
+  const stopExitCode = await stop();
+  if (stopExitCode !== 0) {
+    return stopExitCode;
+  }
+
+  const removePlistExitCode = await runAsRoot(["/bin/rm", "-f", LAUNCH_DAEMON_PATH]);
+  if (removePlistExitCode !== 0) {
+    return removePlistExitCode;
+  }
+
+  await runAsRoot(["/bin/rm", "-f", getQctlSocketPath(), legacyQctlSocketPath()]);
+  await runAsRoot(["/bin/rmdir", RUNTIME_SOCKET_DIR], "ignore");
+
+  return 0;
 }
 
 /** Returns the qcontrol run configuration file that owns event sink settings. */
@@ -27,12 +236,20 @@ export function getQcontrolRunConfigPath(): string {
 
 /** Returns the Unix socket path where qctl listens for qcontrol run events. */
 export function getQctlSocketPath(): string {
-  return join(defaultQcontrolConfigDir(), "qctl.sock");
+  return defaultQctlSocketPath();
 }
 
 /** Formats the socket path as the URL string expected by qcontrol sinks. */
 export function getQctlSinkUrl(): string {
   return `unix://${pathToFileURL(getQctlSocketPath()).pathname}`;
+}
+
+/** Returns qctl socket URLs that should be treated as wrapper-owned sinks. */
+function getQctlSinkUrls(): string[] {
+  return [
+    getQctlSinkUrl(),
+    `unix://${pathToFileURL(legacyQctlSocketPath()).pathname}`,
+  ];
 }
 
 /** Narrows filesystem failures to Node errno errors without trusting throws. */
@@ -50,21 +267,24 @@ function isSinkTableHeader(line: string): boolean {
   return /^\s*\[\[sinks\]\]\s*(?:#.*)?$/.test(line);
 }
 
-/** Detects the qctl socket URL inside a sink table, regardless of TOML spacing. */
-function sinkBlockTargetsQctlSocket(lines: string[], sinkUrl: string): boolean {
-  return lines.some((line) => line.includes(sinkUrl));
+/** Detects a qctl socket URL inside a sink table, regardless of TOML spacing. */
+function sinkBlockTargetsQctlSocket(lines: string[], sinkUrls: string[]): boolean {
+  return lines.some((line) => sinkUrls.some((sinkUrl) => line.includes(sinkUrl)));
 }
 
 /**
  * Removes qctl-owned sink tables from a run.toml document while preserving every
  * unrelated table, comment, and setting in the user's qcontrol configuration.
  */
-function removeQctlSinkBlock(config: string, sinkUrl: string): { config: string; removed: boolean } {
+function removeQctlSinkBlock(
+  config: string,
+  sinkUrls: string[],
+): { config: string; removed: boolean } {
   const lines = config.split("\n");
   const retainedLines: string[] = [];
   let removed = false;
 
-  for (let index = 0; index < lines.length;) {
+  for (let index = 0; index < lines.length; ) {
     if (!isSinkTableHeader(lines[index])) {
       retainedLines.push(lines[index]);
       index += 1;
@@ -78,7 +298,7 @@ function removeQctlSinkBlock(config: string, sinkUrl: string): { config: string;
     }
 
     const sinkBlock = lines.slice(index, nextIndex);
-    if (!sinkBlockTargetsQctlSocket(sinkBlock, sinkUrl)) {
+    if (!sinkBlockTargetsQctlSocket(sinkBlock, sinkUrls)) {
       retainedLines.push(...sinkBlock);
       index = nextIndex;
       continue;
@@ -101,6 +321,7 @@ function removeQctlSinkBlock(config: string, sinkUrl: string): { config: string;
 async function appendQctlSinkConfig(): Promise<void> {
   const runConfigPath = getQcontrolRunConfigPath();
   const sinkUrl = getQctlSinkUrl();
+  const sinkUrls = getQctlSinkUrls();
 
   let existingConfig = "";
   try {
@@ -112,7 +333,11 @@ async function appendQctlSinkConfig(): Promise<void> {
     }
   }
 
-  if (existingConfig.includes(sinkUrl)) {
+  const migratedConfig = removeQctlSinkBlock(existingConfig, sinkUrls);
+  if (migratedConfig.removed) {
+    existingConfig = migratedConfig.config;
+    await writeFile(runConfigPath, existingConfig, "utf8");
+  } else if (existingConfig.includes(sinkUrl)) {
     return;
   }
 
@@ -135,7 +360,7 @@ async function appendQctlSinkConfig(): Promise<void> {
 /** Removes qctl's run-event sink from run.toml when it is present. */
 async function removeQctlSinkConfig(): Promise<void> {
   const runConfigPath = getQcontrolRunConfigPath();
-  const sinkUrl = getQctlSinkUrl();
+  const sinkUrls = getQctlSinkUrls();
 
   let existingConfig: string;
   try {
@@ -148,7 +373,7 @@ async function removeQctlSinkConfig(): Promise<void> {
     return;
   }
 
-  const updated = removeQctlSinkBlock(existingConfig, sinkUrl);
+  const updated = removeQctlSinkBlock(existingConfig, sinkUrls);
   if (!updated.removed) {
     return;
   }
@@ -158,17 +383,50 @@ async function removeQctlSinkConfig(): Promise<void> {
 
 /** Initializes qcontrol with elevated privileges, then installs qctl's sink hook. */
 export async function install(): Promise<number> {
+  const launchDaemonPlist = buildLaunchDaemonPlist();
   const initExitCode = await runQcontrolAsRoot({ args: ["init"] });
   if (initExitCode !== 0) {
     return initExitCode;
   }
 
   await appendQctlSinkConfig();
-  return 0;
+  return installLaunchDaemon(launchDaemonPlist);
 }
 
 /** Removes qctl's sink hook, then deinitializes qcontrol host integration. */
 export async function uninstall(): Promise<number> {
+  const launchDaemonExitCode = await removeLaunchDaemon();
+  if (launchDaemonExitCode !== 0) {
+    return launchDaemonExitCode;
+  }
+
   await removeQctlSinkConfig();
-  return runQcontrolAsRoot({ args: ["deinit"] });
+  // return runQcontrolAsRoot({ args: ["deinit"] });
+  return 0;
+}
+
+/** Loads the root LaunchDaemon and asks launchd to run the daemon immediately. */
+export async function start(): Promise<number> {
+  if (!(await isLaunchDaemonLoaded())) {
+    const bootstrapExitCode = await runAsRoot([
+      "launchctl",
+      "bootstrap",
+      "system",
+      LAUNCH_DAEMON_PATH,
+    ]);
+    if (bootstrapExitCode !== 0) {
+      return bootstrapExitCode;
+    }
+  }
+
+  return runAsRoot(["launchctl", "kickstart", "-k", LAUNCH_DAEMON_TARGET]);
+}
+
+/** Unloads the root LaunchDaemon so KeepAlive cannot restart the scanner. */
+export async function stop(): Promise<number> {
+  if (!(await isLaunchDaemonLoaded())) {
+    return 0;
+  }
+
+  return runAsRoot(["launchctl", "bootout", LAUNCH_DAEMON_TARGET]);
 }

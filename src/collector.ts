@@ -2,7 +2,7 @@
  * Owns qctl's Unix socket event collector, which receives qcontrol sink records
  * from the configured socket path and dispatches each record to forwarders.
  */
-import { lstat, mkdir, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 
@@ -12,6 +12,7 @@ import { getQctlSocketPath } from "./installation";
 /** Configures socket ownership and forwarding behavior for a collector instance. */
 export interface CollectorOptions {
   socketPath?: string;
+  socketMode?: number;
   forwarders?: Forwarder[];
 }
 
@@ -102,11 +103,13 @@ class EventConnection {
  */
 export class Collector {
   private readonly forwarders: Forwarder[];
+  private readonly socketMode?: number;
   private readonly socketPath: string;
   private server?: Server;
 
   constructor(options: CollectorOptions = {}) {
     this.socketPath = options.socketPath ?? getQctlSocketPath();
+    this.socketMode = options.socketMode;
     this.forwarders = options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()];
   }
 
@@ -147,6 +150,12 @@ export class Collector {
       server.once("listening", onListening);
       server.listen(this.socketPath);
     });
+
+    if (this.socketMode !== undefined) {
+      // The launchd root daemon owns the socket file, but user qcontrol runs
+      // still need to connect to the sink configured in the user's run.toml.
+      await chmod(this.socketPath, this.socketMode);
+    }
 
     this.server = server;
     return server;

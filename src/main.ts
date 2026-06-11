@@ -4,17 +4,25 @@
  */
 import { Collector } from "./collector";
 import { ConsoleForwarder } from "./forwarder";
-import { install, uninstall } from "./installation";
+import { install, start, stop, uninstall } from "./installation";
 import { runQcontrol } from "./qcontrol";
 import { Scanner } from "./scanner";
+
+/** Detects the root-owned launchd runtime that must share its socket with users. */
+function shouldOpenDaemonSocket(): boolean {
+  return process.getuid?.() === 0;
+}
 
 /**
  * Starts qctl's local event pipeline by binding the collector socket before the
  * scanner begins emitting qcontrol events into that sink.
  */
-export async function start(): Promise<number> {
+export async function daemon(): Promise<number> {
   const forwarder = new ConsoleForwarder();
-  const collector = new Collector({ forwarders: [forwarder] });
+  const collector = new Collector({
+    forwarders: [forwarder],
+    socketMode: shouldOpenDaemonSocket() ? 0o666 : undefined,
+  });
   const scanner = new Scanner();
 
   await collector.start();
@@ -67,8 +75,9 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     case "start":
       return start();
     case "stop":
-      console.log(`${args[0]} not yet implemented`);
-      return 0;
+      return stop();
+    case "daemon":
+      return daemon();
     default:
       return runQcontrol({ args });
   }
