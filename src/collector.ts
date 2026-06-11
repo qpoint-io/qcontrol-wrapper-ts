@@ -19,6 +19,13 @@ import { getQctlSocketPath } from "./installation";
 const DEFAULT_QUEUE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 10_000;
 
+/**
+ * Raw socket record before the collector vouches for its shape. Records are
+ * only narrowed to the public QcontrolEvent contract when handed to
+ * forwarders, so all defensive field reads stay on this loose type.
+ */
+type RawRecord = Record<string, unknown>;
+
 /** Configures socket ownership and forwarding behavior for a collector instance. */
 export interface CollectorOptions {
   socketPath?: string;
@@ -30,7 +37,7 @@ export interface CollectorOptions {
 
 /** Tracks an unresolved event until its installation and process can be found. */
 interface QueuedEvent {
-  event: QcontrolEvent;
+  event: RawRecord;
   expiresAt: number;
 }
 
@@ -66,12 +73,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Returns the event payload only when qcontrol provided an object payload. */
-function getPayload(event: QcontrolEvent): Record<string, unknown> | undefined {
+function getPayload(event: RawRecord): RawRecord | undefined {
   return isRecord(event.payload) ? event.payload : undefined;
 }
 
 /** Returns the qcontrol run block that carries dependencies for runtime events. */
-function getRun(event: QcontrolEvent): Record<string, unknown> | undefined {
+function getRun(event: RawRecord): RawRecord | undefined {
   return isRecord(event.run) ? event.run : undefined;
 }
 
@@ -88,7 +95,7 @@ function getNumberField(record: Record<string, unknown>, field: string): number 
 }
 
 /** Finds the installation dependency using the schema appropriate to the event. */
-function getDependencyInstallationId(event: QcontrolEvent): string | undefined {
+function getDependencyInstallationId(event: RawRecord): string | undefined {
   const run = getRun(event);
   const payload = getPayload(event);
 
@@ -96,7 +103,7 @@ function getDependencyInstallationId(event: QcontrolEvent): string | undefined {
 }
 
 /** Finds the process dependency using run metadata before legacy payload fields. */
-function getDependencyPid(event: QcontrolEvent): number | undefined {
+function getDependencyPid(event: RawRecord): number | undefined {
   const run = getRun(event);
   const payload = getPayload(event);
 
@@ -109,9 +116,9 @@ function getDependencyPid(event: QcontrolEvent): number | undefined {
  */
 class EventRouter {
   private readonly forwarders: Forwarder[];
-  private readonly installations = new Map<string, QcontrolInstallation>();
+  private readonly installations = new Map<string, RawRecord>();
   private readonly maxQueuedEvents: number;
-  private readonly processes = new Map<number, QcontrolProcess>();
+  private readonly processes = new Map<number, RawRecord>();
   private readonly queueTtlMs: number;
   private queuedEvents: QueuedEvent[] = [];
 
@@ -122,7 +129,7 @@ class EventRouter {
   }
 
   /** Resolves, forwards, or queues one parsed qcontrol event. */
-  route(event: QcontrolEvent): void {
+  route(event: RawRecord): void {
     const now = Date.now();
     this.expireQueuedEvents(now);
 
@@ -138,7 +145,7 @@ class EventRouter {
    * Attempts delivery without retaining unresolved events; callers decide whether
    * an unresolved record belongs in the pending queue.
    */
-  private tryForward(event: QcontrolEvent): boolean {
+  private tryForward(event: RawRecord): boolean {
     switch (event.type) {
       case "installation.discovered":
         return this.forwardInstallationDiscovered(event);
@@ -150,7 +157,7 @@ class EventRouter {
   }
 
   /** Stores a discovered installation and forwards the event with itself attached. */
-  private forwardInstallationDiscovered(event: QcontrolEvent): boolean {
+  private forwardInstallationDiscovered(event: RawRecord): boolean {
     const installation = getPayload(event);
     const installationId = installation ? getStringField(installation, "id") : undefined;
     if (!installation || !installationId) {
@@ -164,7 +171,7 @@ class EventRouter {
   }
 
   /** Stores a started process after its installation is available. */
-  private forwardProcessStarted(event: QcontrolEvent): boolean {
+  private forwardProcessStarted(event: RawRecord): boolean {
     const processRecord = getPayload(event);
     const installationId = processRecord ? getStringField(processRecord, "installation_id") : undefined;
     const pid = processRecord ? getNumberField(processRecord, "pid") : undefined;
@@ -173,9 +180,10 @@ class EventRouter {
       return true;
     }
 
-    // add entity_id as a globally unique identifier for the process
-    const entity_id = `${String(processRecord.started_at)}_${String(pid)}`;
-    processRecord.entity_id = entity_id;
+    // Add entity_id as a globally unique identifier for the process.
+    const startedAtMs = Date.parse(String(processRecord.started_at));
+    const startSecs = Number.isFinite(startedAtMs) ? Math.floor(startedAtMs / 1000) : 0;
+    processRecord.entity_id = `pid:${String(pid)}:start:${String(startSecs)}`;
 
     const installation = this.installations.get(installationId);
     if (!installation) {
@@ -188,7 +196,7 @@ class EventRouter {
   }
 
   /** Forwards non-root events only after both installation and process exist. */
-  private forwardDependentEvent(event: QcontrolEvent): boolean {
+  private forwardDependentEvent(event: RawRecord): boolean {
     const installationId = getDependencyInstallationId(event);
     const pid = getDependencyPid(event);
     if (!installationId || pid === undefined) {
@@ -208,14 +216,20 @@ class EventRouter {
   }
 
   /** Delivers a resolved event to each configured destination in collector order. */
-  private forward(event: QcontrolEvent, installation?: QcontrolInstallation, processRecord?: QcontrolProcess): void {
+  private forward(event: RawRecord, installation?: RawRecord, processRecord?: RawRecord): void {
+    // The collector trusts qcontrol to emit schema-conforming records, so the
+    // narrowing to the public event contract happens here in one place.
     for (const forwarder of this.forwarders) {
-      forwarder.forward(event, installation, processRecord);
+      forwarder.forward(
+        event as QcontrolEvent,
+        installation as QcontrolInstallation | undefined,
+        processRecord as QcontrolProcess | undefined,
+      );
     }
   }
 
   /** Retains an unresolved event while bounding memory by count and age. */
-  private queue(event: QcontrolEvent, now: number): void {
+  private queue(event: RawRecord, now: number): void {
     if (this.maxQueuedEvents <= 0) {
       return;
     }
@@ -322,7 +336,7 @@ class EventConnection {
    * Parses a socket record at the collector boundary so downstream forwarders do
    * not need to know about qcontrol's newline-delimited transport format.
    */
-  private parseRecord(record: string): QcontrolEvent | undefined {
+  private parseRecord(record: string): RawRecord | undefined {
     let event: unknown;
 
     try {
@@ -338,7 +352,7 @@ class EventConnection {
       return undefined;
     }
 
-    return event as QcontrolEvent;
+    return event as RawRecord;
   }
 
   /** Delivers an event object to the collector's dependency resolver. */

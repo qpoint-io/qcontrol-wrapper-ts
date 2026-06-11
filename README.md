@@ -101,6 +101,46 @@ Dependency lookup uses qcontrol metadata in this order:
 
 Unresolved events are queued briefly to handle out-of-order delivery. The default queue TTL is five minutes and the default maximum queue size is 10,000 events.
 
+## Event types
+
+The forwarder arguments are fully typed. `QcontrolEvent` is a discriminated union over every run and scan record, so narrowing on `event.type` gives you the concrete payload type — no casts needed. Payload types can also be imported by name for handler signatures:
+
+```ts
+import type { LlmRequest } from "./types/qcontrol-run";
+import type { InstallationRecord } from "./types/qcontrol-scan";
+
+function handleLlmRequest(payload: LlmRequest, process?: QcontrolProcess): void {
+  // payload.model, payload.system_instructions, ...
+}
+
+function handleInstallation(payload: InstallationRecord): void {
+  // payload.executable_path, payload.tap, ...
+}
+
+forward(event: QcontrolEvent, installation?: QcontrolInstallation, process?: QcontrolProcess): void {
+  switch (event.type) {
+    case "llm.request":
+      handleLlmRequest(event.payload, process); // event.payload is LlmRequest here
+      break;
+    case "installation.discovered":
+      handleInstallation(event.payload); // event.payload is InstallationRecord here
+      break;
+  }
+}
+```
+
+Unhandled event types fall through silently, so new qcontrol event types do not require code changes.
+
+The underlying types live in `src/types/`:
+
+- `qcontrol-run.ts` (`RunRecord`): records from `qcontrol run` workloads
+- `qcontrol-scan.ts` (`ScanEvent`): records from `qcontrol scan`
+- `plugin.ts` (`PluginEvent`): custom events from third-party qcontrol plugins
+
+`QcontrolProcess` additionally carries `entity_id` (`pid:<pid>:start:<unix-epoch-seconds>`), a globally unique process identifier the collector derives from `pid` and `started_at`.
+
+The files are auto-generated from qcontrol's event schemas and updated together with the bundled qcontrol version; do not edit them by hand.
+
 ## Development
 
 Install dependencies:
