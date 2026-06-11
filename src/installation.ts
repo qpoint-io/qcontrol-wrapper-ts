@@ -30,8 +30,8 @@ export function getQctlSocketPath(): string {
   return join(defaultQcontrolConfigDir(), "qctl.sock");
 }
 
-/** Formats the socket path as the URL string expected by qcontrol sink config. */
-function getQctlSinkUrl(): string {
+/** Formats the socket path as the URL string expected by qcontrol sinks. */
+export function getQctlSinkUrl(): string {
   return `unix://${pathToFileURL(getQctlSocketPath()).pathname}`;
 }
 
