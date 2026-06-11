@@ -24,6 +24,7 @@ const LAUNCH_DAEMON_PATH = `/Library/LaunchDaemons/${LAUNCH_DAEMON_LABEL}.plist`
 const LAUNCH_DAEMON_TARGET = `system/${LAUNCH_DAEMON_LABEL}`;
 const LAUNCHD_LOG_DIR = "/Library/Logs/qctl";
 const RUNTIME_SOCKET_DIR = "/var/run/qctl";
+const RUNTIME_SOCKET_NAME = "collector.sock";
 
 /** Resolves the qcontrol configuration directory using qcontrol's XDG layout. */
 function defaultQcontrolConfigDir(): string {
@@ -38,11 +39,6 @@ function defaultQcontrolConfigDir(): string {
   return join(homedir(), ".config", "qcontrol");
 }
 
-/** Identifies the user whose qcontrol config receives qctl's socket sink hook. */
-function currentUserId(): number {
-  return process.getuid?.() ?? 0;
-}
-
 /** Returns the historic config-local socket path so uninstall can migrate it out. */
 function legacyQctlSocketPath(): string {
   return join(defaultQcontrolConfigDir(), "qctl.sock");
@@ -54,7 +50,7 @@ function defaultQctlSocketPath(): string {
     return process.env[QCTL_SOCKET_PATH_ENV];
   }
 
-  return join(RUNTIME_SOCKET_DIR, `${currentUserId()}.sock`);
+  return join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
 }
 
 /** Escapes launchd plist string values without taking a dependency on plist IO. */

@@ -173,7 +173,7 @@ These instructions assume the custom forwarder has already been implemented and 
    ./bin/qctl uninstall
    ```
 
-The daemon socket defaults to `/var/run/qctl/<uid>.sock`. qcontrol run configuration defaults to `$XDG_CONFIG_HOME/qcontrol/run.toml` or `~/.config/qcontrol/run.toml`.
+The daemon socket defaults to `/var/run/qctl/collector.sock`. qcontrol run configuration defaults to `$XDG_CONFIG_HOME/qcontrol/run.toml` or `~/.config/qcontrol/run.toml`.
 
 ## Configuration overrides
 
