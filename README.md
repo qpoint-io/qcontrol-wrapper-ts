@@ -172,7 +172,7 @@ Build the macOS installer package:
 make pkg
 ```
 
-The package is written to `dist/qctl-<version>.pkg` with package identifier `io.qpoint.qctl`. It installs the compiled wrapper at `/usr/local/bin/qctl` and runs a root-only `postinstall` hook that invokes `/usr/local/bin/qctl install-system`. Per-user qcontrol sink setup is intentionally separate; each user who should send qcontrol events to qctl should run `/usr/local/bin/qctl init-user` once that user initialization command is available.
+The package is written to `dist/qctl-<version>.pkg` with package identifier `io.qpoint.qctl`. It installs the compiled wrapper at `/usr/local/bin/qctl` and runs a root-only `postinstall` hook that invokes `/usr/local/bin/qctl install-system`. That system setup installs the root-owned LaunchDaemon/log/runtime assets only, with the daemon listening on the stable package socket `/var/run/qctl/qctl.sock`; qcontrol trust/user initialization and per-user qcontrol sink setup are intentionally separate. Each user who should send qcontrol events to qctl should run `/usr/local/bin/qctl init-user` once that user initialization command is available.
 
 Inspect a package before installing it:
 

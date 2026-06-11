@@ -53,6 +53,11 @@ function defaultQctlSocketPath(): string {
   return join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
 }
 
+/** Resolves the stable socket path used by package-installed system daemons. */
+function systemQctlSocketPath(): string {
+  return join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
+}
+
 /** Escapes launchd plist string values without taking a dependency on plist IO. */
 function escapePlistString(value: string): string {
   return value
@@ -82,17 +87,27 @@ function getQctlExecutablePath(): string {
   return resolve(process.execPath);
 }
 
+/** Controls which qctl paths and environment variables are written to launchd. */
+interface LaunchDaemonPlistOptions {
+  includeUserConfigEnvironment?: boolean;
+  socketPath?: string;
+}
+
 /** Builds the root LaunchDaemon plist that runs qctl's daemon command in place. */
-function buildLaunchDaemonPlist(): string {
+function buildLaunchDaemonPlist(options: LaunchDaemonPlistOptions = {}): string {
   const configDir = defaultQcontrolConfigDir();
+  const includeUserConfigEnvironment = options.includeUserConfigEnvironment ?? true;
   const values = {
     executable: escapePlistString(getQctlExecutablePath()),
     configDir: escapePlistString(configDir),
-    socketPath: escapePlistString(getQctlSocketPath()),
+    socketPath: escapePlistString(options.socketPath ?? getQctlSocketPath()),
     xdgConfigHome: escapePlistString(dirname(configDir)),
     stdoutPath: escapePlistString(join(LAUNCHD_LOG_DIR, "stdout.log")),
     stderrPath: escapePlistString(join(LAUNCHD_LOG_DIR, "stderr.log")),
   };
+  const userConfigEnvironment = includeUserConfigEnvironment
+    ? `    <key>${QCTL_CONFIG_DIR_ENV}</key>\n    <string>${values.configDir}</string>\n    <key>XDG_CONFIG_HOME</key>\n    <string>${values.xdgConfigHome}</string>\n`
+    : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -107,12 +122,8 @@ function buildLaunchDaemonPlist(): string {
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>${QCTL_CONFIG_DIR_ENV}</key>
-    <string>${values.configDir}</string>
-    <key>${QCTL_SOCKET_PATH_ENV}</key>
+${userConfigEnvironment}    <key>${QCTL_SOCKET_PATH_ENV}</key>
     <string>${values.socketPath}</string>
-    <key>XDG_CONFIG_HOME</key>
-    <string>${values.xdgConfigHome}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -377,15 +388,12 @@ async function removeQctlSinkConfig(): Promise<void> {
   await writeFile(runConfigPath, updated.config, "utf8");
 }
 
-/** Initializes qcontrol with elevated privileges and installs root-owned host assets. */
+/** Installs root-owned host assets without mutating per-user qcontrol state. */
 export async function installSystem(): Promise<number> {
-  const launchDaemonPlist = buildLaunchDaemonPlist();
-  const initExitCode = await runQcontrolAsRoot({ args: ["init"] });
-  if (initExitCode !== 0) {
-    return initExitCode;
-  }
-
-  return installLaunchDaemon(launchDaemonPlist);
+  return installLaunchDaemon(buildLaunchDaemonPlist({
+    includeUserConfigEnvironment: false,
+    socketPath: systemQctlSocketPath(),
+  }));
 }
 
 /** Initializes qcontrol with elevated privileges, then installs qctl's sink hook. */
