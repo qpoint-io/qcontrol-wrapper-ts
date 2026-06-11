@@ -1,19 +1,37 @@
 /**
  * Owns qctl's Unix socket event collector, which receives qcontrol sink records
- * from the configured socket path and dispatches each record to forwarders.
+ * from the configured socket path, resolves event dependencies, and dispatches
+ * complete event records to forwarders.
  */
 import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 
-import { ConsoleForwarder, type Forwarder } from "./forwarder";
+import {
+  ConsoleForwarder,
+  type Forwarder,
+  type QcontrolEvent,
+  type QcontrolInstallation,
+  type QcontrolProcess,
+} from "./forwarder";
 import { getQctlSocketPath } from "./installation";
+
+const DEFAULT_QUEUE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_QUEUED_EVENTS = 10_000;
 
 /** Configures socket ownership and forwarding behavior for a collector instance. */
 export interface CollectorOptions {
   socketPath?: string;
   socketMode?: number;
   forwarders?: Forwarder[];
+  queueTtlMs?: number;
+  maxQueuedEvents?: number;
+}
+
+/** Tracks an unresolved event until its installation and process can be found. */
+interface QueuedEvent {
+  event: QcontrolEvent;
+  expiresAt: number;
 }
 
 /** Narrows filesystem failures to Node errno errors without trusting throws. */
@@ -42,20 +60,227 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
   await rm(socketPath);
 }
 
+/** Confirms a parsed value is an object payload that can carry qcontrol fields. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Returns the event payload only when qcontrol provided an object payload. */
+function getPayload(event: QcontrolEvent): Record<string, unknown> | undefined {
+  return isRecord(event.payload) ? event.payload : undefined;
+}
+
+/** Returns the qcontrol run block that carries dependencies for runtime events. */
+function getRun(event: QcontrolEvent): Record<string, unknown> | undefined {
+  return isRecord(event.run) ? event.run : undefined;
+}
+
+/** Reads a required string identifier from a payload without coercing bad data. */
+function getStringField(record: Record<string, unknown>, field: string): string | undefined {
+  const value = record[field];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Reads a required numeric identifier from a payload without coercing bad data. */
+function getNumberField(record: Record<string, unknown>, field: string): number | undefined {
+  const value = record[field];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Finds the installation dependency using the schema appropriate to the event. */
+function getDependencyInstallationId(event: QcontrolEvent): string | undefined {
+  const run = getRun(event);
+  const payload = getPayload(event);
+
+  return (run && getStringField(run, "installation_id")) ?? (payload && getStringField(payload, "installation_id"));
+}
+
+/** Finds the process dependency using run metadata before legacy payload fields. */
+function getDependencyPid(event: QcontrolEvent): number | undefined {
+  const run = getRun(event);
+  const payload = getPayload(event);
+
+  return (run && getNumberField(run, "agent_pid")) ?? (run && getNumberField(run, "run_pid")) ?? (payload && getNumberField(payload, "pid"));
+}
+
 /**
- * Splits incoming sink bytes into printable records while preserving partial
- * records that span socket chunks.
+ * Resolves qcontrol event dependencies by indexing root installation and process
+ * events, then holding dependent records until both indexes can satisfy them.
+ */
+class EventRouter {
+  private readonly forwarders: Forwarder[];
+  private readonly installations = new Map<string, QcontrolInstallation>();
+  private readonly maxQueuedEvents: number;
+  private readonly processes = new Map<number, QcontrolProcess>();
+  private readonly queueTtlMs: number;
+  private queuedEvents: QueuedEvent[] = [];
+
+  constructor(forwarders: Forwarder[], queueTtlMs: number, maxQueuedEvents: number) {
+    this.forwarders = forwarders;
+    this.queueTtlMs = queueTtlMs;
+    this.maxQueuedEvents = maxQueuedEvents;
+  }
+
+  /** Resolves, forwards, or queues one parsed qcontrol event. */
+  route(event: QcontrolEvent): void {
+    const now = Date.now();
+    this.expireQueuedEvents(now);
+
+    if (this.tryForward(event)) {
+      this.retryQueuedEvents();
+      return;
+    }
+
+    this.queue(event, now);
+  }
+
+  /**
+   * Attempts delivery without retaining unresolved events; callers decide whether
+   * an unresolved record belongs in the pending queue.
+   */
+  private tryForward(event: QcontrolEvent): boolean {
+    switch (event.type) {
+      case "installation.discovered":
+        return this.forwardInstallationDiscovered(event);
+      case "process.started":
+        return this.forwardProcessStarted(event);
+      default:
+        return this.forwardDependentEvent(event);
+    }
+  }
+
+  /** Stores a discovered installation and forwards the event with itself attached. */
+  private forwardInstallationDiscovered(event: QcontrolEvent): boolean {
+    const installation = getPayload(event);
+    const installationId = installation ? getStringField(installation, "id") : undefined;
+    if (!installation || !installationId) {
+      console.error("dropping installation.discovered event without payload.id");
+      return true;
+    }
+
+    this.installations.set(installationId, installation);
+    this.forward(event, installation);
+    return true;
+  }
+
+  /** Stores a started process after its installation is available. */
+  private forwardProcessStarted(event: QcontrolEvent): boolean {
+    const processRecord = getPayload(event);
+    const installationId = processRecord ? getStringField(processRecord, "installation_id") : undefined;
+    const pid = processRecord ? getNumberField(processRecord, "pid") : undefined;
+    if (!processRecord || !installationId || pid === undefined) {
+      console.error("dropping process.started event without payload.installation_id or payload.pid");
+      return true;
+    }
+
+    const installation = this.installations.get(installationId);
+    if (!installation) {
+      return false;
+    }
+
+    this.processes.set(pid, processRecord);
+    this.forward(event, installation, processRecord);
+    return true;
+  }
+
+  /** Forwards non-root events only after both installation and process exist. */
+  private forwardDependentEvent(event: QcontrolEvent): boolean {
+    const installationId = getDependencyInstallationId(event);
+    const pid = getDependencyPid(event);
+    if (!installationId || pid === undefined) {
+      console.error(`dropping qcontrol event without process dependencies: ${String(event.type)}`);
+      return true;
+    }
+
+    const processRecord = this.processes.get(pid);
+    const processInstallationId = processRecord ? getStringField(processRecord, "installation_id") : undefined;
+    const installation = this.installations.get(installationId) ?? (processInstallationId ? this.installations.get(processInstallationId) : undefined);
+    if (!installation || !processRecord) {
+      return false;
+    }
+
+    this.forward(event, installation, processRecord);
+    return true;
+  }
+
+  /** Delivers a resolved event to each configured destination in collector order. */
+  private forward(event: QcontrolEvent, installation?: QcontrolInstallation, processRecord?: QcontrolProcess): void {
+    for (const forwarder of this.forwarders) {
+      forwarder.forward(event, installation, processRecord);
+    }
+  }
+
+  /** Retains an unresolved event while bounding memory by count and age. */
+  private queue(event: QcontrolEvent, now: number): void {
+    if (this.maxQueuedEvents <= 0) {
+      return;
+    }
+
+    if (this.queuedEvents.length >= this.maxQueuedEvents) {
+      this.queuedEvents.shift();
+    }
+
+    this.queuedEvents.push({
+      event,
+      expiresAt: now + this.queueTtlMs,
+    });
+  }
+
+  /** Removes queued events whose dependencies did not arrive before the TTL. */
+  private expireQueuedEvents(now: number): void {
+    if (this.queuedEvents.length === 0) {
+      return;
+    }
+
+    const retained: QueuedEvent[] = [];
+    for (const queuedEvent of this.queuedEvents) {
+      if (queuedEvent.expiresAt > now) {
+        retained.push(queuedEvent);
+      }
+    }
+
+    this.queuedEvents = retained;
+  }
+
+  /**
+   * Replays queued events until the latest installation/process discovery stops
+   * unlocking more pending records.
+   */
+  private retryQueuedEvents(): void {
+    let madeProgress = true;
+
+    while (madeProgress) {
+      madeProgress = false;
+      this.expireQueuedEvents(Date.now());
+
+      const unresolved: QueuedEvent[] = [];
+      for (const queuedEvent of this.queuedEvents) {
+        if (this.tryForward(queuedEvent.event)) {
+          madeProgress = true;
+        } else {
+          unresolved.push(queuedEvent);
+        }
+      }
+
+      this.queuedEvents = unresolved;
+    }
+  }
+}
+
+/**
+ * Splits incoming sink bytes into JSON records while preserving partial records
+ * that span socket chunks.
  */
 class EventConnection {
   private buffered = "";
-  private readonly forwarders: Forwarder[];
+  private readonly router: EventRouter;
 
-  constructor(socket: Socket, forwarders: Forwarder[]) {
-    this.forwarders = forwarders;
+  constructor(socket: Socket, router: EventRouter) {
+    this.router = router;
 
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
-      this.printRecords(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+      this.collectRecords(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
     });
     socket.on("end", () => {
       this.flush();
@@ -65,8 +290,8 @@ class EventConnection {
     });
   }
 
-  /** Forwards all complete records in a chunk and buffers an incomplete suffix. */
-  private printRecords(chunk: string): void {
+  /** Forwards all complete JSON records in a chunk and buffers an incomplete suffix. */
+  private collectRecords(chunk: string): void {
     this.buffered += chunk;
 
     const records = this.buffered.split(/\r?\n/);
@@ -89,11 +314,37 @@ class EventConnection {
     this.buffered = "";
   }
 
-  /** Delivers an event to each configured destination in collector order. */
-  private forward(event: string): void {
-    for (const forwarder of this.forwarders) {
-      forwarder.forward(event);
+  /**
+   * Parses a socket record at the collector boundary so downstream forwarders do
+   * not need to know about qcontrol's newline-delimited transport format.
+   */
+  private parseRecord(record: string): QcontrolEvent | undefined {
+    let event: unknown;
+
+    try {
+      event = JSON.parse(record) as unknown;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`dropping malformed qcontrol event: ${reason}`);
+      return undefined;
     }
+
+    if (typeof event !== "object" || event === null || Array.isArray(event)) {
+      console.error("dropping qcontrol event that did not parse to an object");
+      return undefined;
+    }
+
+    return event as QcontrolEvent;
+  }
+
+  /** Delivers an event object to the collector's dependency resolver. */
+  private forward(record: string): void {
+    const event = this.parseRecord(record);
+    if (!event) {
+      return;
+    }
+
+    this.router.route(event);
   }
 }
 
@@ -102,7 +353,7 @@ class EventConnection {
  * records until stopped by the owning process.
  */
 export class Collector {
-  private readonly forwarders: Forwarder[];
+  private readonly router: EventRouter;
   private readonly socketMode?: number;
   private readonly socketPath: string;
   private server?: Server;
@@ -110,7 +361,11 @@ export class Collector {
   constructor(options: CollectorOptions = {}) {
     this.socketPath = options.socketPath ?? getQctlSocketPath();
     this.socketMode = options.socketMode;
-    this.forwarders = options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()];
+    this.router = new EventRouter(
+      options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()],
+      options.queueTtlMs ?? DEFAULT_QUEUE_TTL_MS,
+      options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS,
+    );
   }
 
   /** Returns the socket file path that this collector binds when started. */
@@ -133,7 +388,7 @@ export class Collector {
     await removeStaleSocket(this.socketPath);
 
     const server = createServer((socket) => {
-      new EventConnection(socket, this.forwarders);
+      new EventConnection(socket, this.router);
     });
 
     await new Promise<void>((resolve, reject) => {
