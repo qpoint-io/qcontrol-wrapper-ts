@@ -377,16 +377,26 @@ async function removeQctlSinkConfig(): Promise<void> {
   await writeFile(runConfigPath, updated.config, "utf8");
 }
 
-/** Initializes qcontrol with elevated privileges, then installs qctl's sink hook. */
-export async function install(): Promise<number> {
+/** Initializes qcontrol with elevated privileges and installs root-owned host assets. */
+export async function installSystem(): Promise<number> {
   const launchDaemonPlist = buildLaunchDaemonPlist();
   const initExitCode = await runQcontrolAsRoot({ args: ["init"] });
   if (initExitCode !== 0) {
     return initExitCode;
   }
 
-  await appendQctlSinkConfig();
   return installLaunchDaemon(launchDaemonPlist);
+}
+
+/** Initializes qcontrol with elevated privileges, then installs qctl's sink hook. */
+export async function install(): Promise<number> {
+  const systemExitCode = await installSystem();
+  if (systemExitCode !== 0) {
+    return systemExitCode;
+  }
+
+  await appendQctlSinkConfig();
+  return 0;
 }
 
 /** Removes qctl's sink hook, then deinitializes qcontrol host integration. */

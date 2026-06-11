@@ -10,6 +10,11 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_ROOT="$ROOT_DIR/build/pkgroot"
 DIST_DIR="$ROOT_DIR/dist"
 PKG_PATH="$DIST_DIR/qctl-$VERSION.pkg"
+SCRIPT_ARGS=
+
+if [ -d "$ROOT_DIR/packaging/scripts" ]; then
+  SCRIPT_ARGS="--scripts $ROOT_DIR/packaging/scripts"
+fi
 
 cd "$ROOT_DIR"
 
@@ -22,10 +27,13 @@ if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$BUILD_ROOT" || true
 fi
 
-COPYFILE_DISABLE=1 pkgbuild \
+COPYFILE_DISABLE=true pkgbuild \
   --identifier "$PKG_IDENTIFIER" \
   --version "$VERSION" \
   --root "$BUILD_ROOT" \
+  --filter '\.DS_Store$' \
+  --filter '(^|/)\._' \
+  $SCRIPT_ARGS \
   --install-location / \
   "$PKG_PATH"
 

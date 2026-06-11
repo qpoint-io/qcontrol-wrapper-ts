@@ -166,6 +166,33 @@ make update-qcontrol
 make clean
 ```
 
+Build the macOS installer package:
+
+```sh
+make pkg
+```
+
+The package is written to `dist/qctl-<version>.pkg` with package identifier `io.qpoint.qctl`. It installs the compiled wrapper at `/usr/local/bin/qctl` and runs a root-only `postinstall` hook that invokes `/usr/local/bin/qctl install-system`. Per-user qcontrol sink setup is intentionally separate; each user who should send qcontrol events to qctl should run `/usr/local/bin/qctl init-user` once that user initialization command is available.
+
+Inspect a package before installing it:
+
+```sh
+scripts/verify-pkg.sh dist/qctl-0.1.0.pkg
+pkgutil --payload-files dist/qctl-0.1.0.pkg
+```
+
+Install the package locally:
+
+```sh
+sudo installer -pkg dist/qctl-0.1.0.pkg -target /
+```
+
+Verify the installed binary:
+
+```sh
+/usr/local/bin/qctl --version
+```
+
 During development, `bun run dev -- <args>` runs the wrapper from source. Installation should be performed with the compiled binary unless `QCTL_EXECUTABLE` points at a compiled wrapper, because launchd must execute a stable binary path.
 
 ## Operator instructions
