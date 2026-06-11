@@ -173,6 +173,10 @@ class EventRouter {
       return true;
     }
 
+    // add entity_id as a globally unique identifier for the process
+    const entity_id = `${String(processRecord.started_at)}_${String(pid)}`;
+    processRecord.entity_id = entity_id;
+
     const installation = this.installations.get(installationId);
     if (!installation) {
       return false;

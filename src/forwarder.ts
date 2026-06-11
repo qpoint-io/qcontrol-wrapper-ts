@@ -13,11 +13,6 @@ export type QcontrolInstallation = Record<string, unknown>;
 /** Represents a process payload emitted by a process start event. */
 export type QcontrolProcess = Record<string, unknown>;
 
-/** Confirms a parsed value is an object payload that can carry qcontrol fields. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Receives one parsed qcontrol event plus any dependency records the collector
  * could resolve before delivery.
@@ -52,12 +47,8 @@ export class ConsoleForwarder implements Forwarder {
     installation?: QcontrolInstallation,
     process?: QcontrolProcess,
   ): void {
-    // generate entity_id from process record if available
-    const entity_id = process ? `${String(process.started_at)}_${String(process.pid)}` : undefined;
-
     console.log(JSON.stringify({
       ...event,
-      ...(entity_id ? { payload: { ...(isRecord(event.payload) ? event.payload : {}), entity_id } } : {}),
       ...(installation && this.shouldInjectInstallation(event) ? { installation } : {}),
       ...(process && this.shouldInjectProcess(event) ? { process } : {}),
     }));
