@@ -46,6 +46,9 @@ export async function daemon(): Promise<number> {
       void stopRuntime();
     };
 
+    // TODO: watch for any condition that would require a refresh scanner
+    // and then call scanner.refresh()
+
     process.once("SIGINT", handleSignal);
     process.once("SIGTERM", handleSignal);
 

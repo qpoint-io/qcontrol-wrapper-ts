@@ -21,14 +21,19 @@ function isCurrentProcessPrivileged(): boolean {
   return uid === 0;
 }
 
-/** Builds the scan command once so privilege handling cannot drift from args. */
-function getScanArgs(autotap: boolean): string[] {
+/** Builds the scan watcher command once so privilege handling cannot drift from args. */
+function getWatchScanArgs(autotap: boolean): string[] {
   const args = ["scan", "--processes", "--watch", "--sink", getQctlSinkUrl()];
   if (autotap) {
     args.push("--tap");
   }
 
   return args;
+}
+
+/** Builds the one-shot scan command used to refresh qcontrol's process view. */
+function getRefreshScanArgs(): string[] {
+  return ["scan", "--processes", "--sink", getQctlSinkUrl()];
 }
 
 /**
@@ -62,7 +67,7 @@ export class Scanner {
       stdin: this.options.stdin ?? (runAsRoot ? "inherit" : "ignore"),
       stdout: this.options.stdout ?? "ignore",
       stderr: this.options.stderr ?? (runAsRoot ? "inherit" : "ignore"),
-      args: getScanArgs(this.options.autotap === true),
+      args: getWatchScanArgs(this.options.autotap === true),
     });
 
     this.process = child;
@@ -75,6 +80,18 @@ export class Scanner {
     });
 
     return child;
+  }
+
+  /** Starts a one-shot process scan against qctl's sink without taking ownership. */
+  async refresh(): Promise<Bun.Subprocess> {
+    return spawnQcontrol({
+      cacheDir: this.options.cacheDir,
+      env: this.options.env,
+      stdin: this.options.stdin ?? "ignore",
+      stdout: this.options.stdout ?? "ignore",
+      stderr: this.options.stderr ?? "ignore",
+      args: getRefreshScanArgs(),
+    });
   }
 
   /** Stops the scanner process owned by this instance and resolves after exit. */
