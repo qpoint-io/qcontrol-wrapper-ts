@@ -18,6 +18,9 @@ import { getQctlSocketPath } from "./installation";
 
 const DEFAULT_QUEUE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 10_000;
+const DEFAULT_MAX_QUEUED_EVENTS_PER_KEY = 1_000;
+const DEFAULT_PROCESS_EVICTION_GRACE_MS = 30 * 1000;
+const SWEEP_INTERVAL_MS = 30 * 1000;
 
 /**
  * Raw socket record before the collector vouches for its shape. Records are
@@ -33,7 +36,31 @@ export interface CollectorOptions {
   forwarders?: Forwarder[];
   queueTtlMs?: number;
   maxQueuedEvents?: number;
+  maxQueuedEventsPerKey?: number;
+  processEvictionGraceMs?: number;
 }
+
+/** Counts collector routing outcomes so shed load is observable from outside. */
+export interface CollectorStats {
+  forwarded: number;
+  queued: number;
+  expired: number;
+  evicted: number;
+  dropped: number;
+  pending: number;
+}
+
+/** Names the index entry an unresolved event is waiting for. */
+type DependencyKey = `inst:${string}` | `pid:${number}`;
+
+/**
+ * Reports what routing did with one event: delivered, discarded as malformed,
+ * or blocked on a specific missing dependency the caller may park it under.
+ */
+type ForwardResult =
+  | { status: "forwarded" }
+  | { status: "dropped" }
+  | { status: "waiting"; on: DependencyKey };
 
 /** Tracks an unresolved event until its installation and process can be found. */
 interface QueuedEvent {
@@ -110,42 +137,117 @@ function getDependencyPid(event: RawRecord): number | undefined {
   return (run && getNumberField(run, "agent_pid")) ?? (run && getNumberField(run, "run_pid")) ?? (payload && getNumberField(payload, "pid"));
 }
 
+/** Resolved configuration the collector hands to its event router. */
+interface EventRouterOptions {
+  forwarders: Forwarder[];
+  queueTtlMs: number;
+  maxQueuedEvents: number;
+  maxQueuedEventsPerKey: number;
+  processEvictionGraceMs: number;
+}
+
 /**
  * Resolves qcontrol event dependencies by indexing root installation and process
  * events, then holding dependent records until both indexes can satisfy them.
+ * Unresolved events are parked under the specific dependency they are missing,
+ * so a discovery only replays the events it can actually unlock.
  */
 class EventRouter {
   private readonly forwarders: Forwarder[];
   private readonly installations = new Map<string, RawRecord>();
-  private readonly maxQueuedEvents: number;
   private readonly processes = new Map<number, RawRecord>();
+  private readonly pending = new Map<DependencyKey, QueuedEvent[]>();
+  private pendingCount = 0;
+  private readonly stoppedProcessDeadlines = new Map<number, number>();
   private readonly queueTtlMs: number;
-  private queuedEvents: QueuedEvent[] = [];
+  private readonly maxQueuedEvents: number;
+  private readonly maxQueuedEventsPerKey: number;
+  private readonly processEvictionGraceMs: number;
+  private readonly counters = { forwarded: 0, queued: 0, expired: 0, evicted: 0, dropped: 0 };
+  private lastReportedShed = 0;
+  private sweepTimer?: NodeJS.Timeout;
 
-  constructor(forwarders: Forwarder[], queueTtlMs: number, maxQueuedEvents: number) {
-    this.forwarders = forwarders;
-    this.queueTtlMs = queueTtlMs;
-    this.maxQueuedEvents = maxQueuedEvents;
+  constructor(options: EventRouterOptions) {
+    this.forwarders = options.forwarders;
+    this.queueTtlMs = options.queueTtlMs;
+    this.maxQueuedEvents = options.maxQueuedEvents;
+    this.maxQueuedEventsPerKey = options.maxQueuedEventsPerKey;
+    this.processEvictionGraceMs = options.processEvictionGraceMs;
   }
 
-  /** Resolves, forwards, or queues one parsed qcontrol event. */
-  route(event: RawRecord): void {
-    const now = Date.now();
-    this.expireQueuedEvents(now);
+  /** Returns a point-in-time snapshot of routing outcomes and queue depth. */
+  get stats(): CollectorStats {
+    return { ...this.counters, pending: this.pendingCount };
+  }
 
-    if (this.tryForward(event)) {
-      this.retryQueuedEvents();
+  /** Resolves, forwards, or parks one parsed qcontrol event. */
+  route(event: RawRecord): void {
+    const result = this.tryForward(event);
+    if (result.status === "waiting") {
+      this.park({ event, expiresAt: Date.now() + this.queueTtlMs }, result.on, true);
+    }
+  }
+
+  /** Starts the periodic sweep that expires parked events and prunes indexes. */
+  startSweeping(): void {
+    if (this.sweepTimer) {
       return;
     }
 
-    this.queue(event, now);
+    this.sweepTimer = setInterval(() => {
+      this.sweep(Date.now());
+    }, SWEEP_INTERVAL_MS);
+    // The sweep exists to serve event traffic; it should never keep an
+    // otherwise-finished process alive.
+    this.sweepTimer.unref();
+  }
+
+  /** Stops the periodic sweep when the owning collector shuts down. */
+  stopSweeping(): void {
+    if (!this.sweepTimer) {
+      return;
+    }
+
+    clearInterval(this.sweepTimer);
+    this.sweepTimer = undefined;
+  }
+
+  /**
+   * Expires parked events past their TTL, unindexes processes whose stop grace
+   * window has lapsed, and reports any load shed since the last sweep.
+   */
+  sweep(now: number): void {
+    for (const [key, bucket] of this.pending) {
+      const retained = bucket.filter((queuedEvent) => queuedEvent.expiresAt > now);
+      const removed = bucket.length - retained.length;
+      if (removed === 0) {
+        continue;
+      }
+
+      this.counters.expired += removed;
+      this.pendingCount -= removed;
+      if (retained.length === 0) {
+        this.pending.delete(key);
+      } else {
+        this.pending.set(key, retained);
+      }
+    }
+
+    for (const [pid, deadline] of this.stoppedProcessDeadlines) {
+      if (deadline <= now) {
+        this.stoppedProcessDeadlines.delete(pid);
+        this.processes.delete(pid);
+      }
+    }
+
+    this.reportShedding();
   }
 
   /**
    * Attempts delivery without retaining unresolved events; callers decide whether
-   * an unresolved record belongs in the pending queue.
+   * a waiting record belongs in the pending queue.
    */
-  private tryForward(event: RawRecord): boolean {
+  private tryForward(event: RawRecord): ForwardResult {
     switch (event.type) {
       case "installation.discovered":
         return this.forwardInstallationDiscovered(event);
@@ -157,27 +259,30 @@ class EventRouter {
   }
 
   /** Stores a discovered installation and forwards the event with itself attached. */
-  private forwardInstallationDiscovered(event: RawRecord): boolean {
+  private forwardInstallationDiscovered(event: RawRecord): ForwardResult {
     const installation = getPayload(event);
     const installationId = installation ? getStringField(installation, "id") : undefined;
     if (!installation || !installationId) {
       console.error("dropping installation.discovered event without payload.id");
-      return true;
+      this.counters.dropped += 1;
+      return { status: "dropped" };
     }
 
     this.installations.set(installationId, installation);
     this.forward(event, installation);
-    return true;
+    this.flushPending(`inst:${installationId}`);
+    return { status: "forwarded" };
   }
 
   /** Stores a started process after its installation is available. */
-  private forwardProcessStarted(event: RawRecord): boolean {
+  private forwardProcessStarted(event: RawRecord): ForwardResult {
     const processRecord = getPayload(event);
     const installationId = processRecord ? getStringField(processRecord, "installation_id") : undefined;
     const pid = processRecord ? getNumberField(processRecord, "pid") : undefined;
     if (!processRecord || !installationId || pid === undefined) {
       console.error("dropping process.started event without payload.installation_id or payload.pid");
-      return true;
+      this.counters.dropped += 1;
+      return { status: "dropped" };
     }
 
     // Add entity_id as a globally unique identifier for the process.
@@ -187,36 +292,52 @@ class EventRouter {
 
     const installation = this.installations.get(installationId);
     if (!installation) {
-      return false;
+      return { status: "waiting", on: `inst:${installationId}` };
     }
 
+    // A restarted or pid-recycled process supersedes any scheduled eviction.
+    this.stoppedProcessDeadlines.delete(pid);
     this.processes.set(pid, processRecord);
     this.forward(event, installation, processRecord);
-    return true;
+    this.flushPending(`pid:${pid}`);
+    return { status: "forwarded" };
   }
 
   /** Forwards non-root events only after both installation and process exist. */
-  private forwardDependentEvent(event: RawRecord): boolean {
+  private forwardDependentEvent(event: RawRecord): ForwardResult {
     const installationId = getDependencyInstallationId(event);
     const pid = getDependencyPid(event);
     if (!installationId || pid === undefined) {
       console.error(`dropping qcontrol event without process dependencies: ${String(event.type)}`);
-      return true;
+      this.counters.dropped += 1;
+      return { status: "dropped" };
     }
 
     const processRecord = this.processes.get(pid);
-    const processInstallationId = processRecord ? getStringField(processRecord, "installation_id") : undefined;
+    if (!processRecord) {
+      return { status: "waiting", on: `pid:${pid}` };
+    }
+
+    const processInstallationId = getStringField(processRecord, "installation_id");
     const installation = this.installations.get(installationId) ?? (processInstallationId ? this.installations.get(processInstallationId) : undefined);
-    if (!installation || !processRecord) {
-      return false;
+    if (!installation) {
+      return { status: "waiting", on: `inst:${installationId}` };
     }
 
     this.forward(event, installation, processRecord);
-    return true;
+    if (event.type === "process.stopped") {
+      // Keep the process resolvable for late in-flight events, then let the
+      // sweep unindex it so the process map cannot grow without bound.
+      this.stoppedProcessDeadlines.set(pid, Date.now() + this.processEvictionGraceMs);
+    }
+
+    return { status: "forwarded" };
   }
 
   /** Delivers a resolved event to each configured destination in collector order. */
   private forward(event: RawRecord, installation?: RawRecord, processRecord?: RawRecord): void {
+    this.counters.forwarded += 1;
+
     // The collector trusts qcontrol to emit schema-conforming records, so the
     // narrowing to the public event contract happens here in one place.
     for (const forwarder of this.forwarders) {
@@ -228,60 +349,104 @@ class EventRouter {
     }
   }
 
-  /** Retains an unresolved event while bounding memory by count and age. */
-  private queue(event: RawRecord, now: number): void {
-    if (this.maxQueuedEvents <= 0) {
+  /**
+   * Retains a waiting event under its missing dependency while bounding memory
+   * per dependency and overall, so one unresolvable sender cannot evict events
+   * that are waiting on healthy dependencies.
+   */
+  private park(queuedEvent: QueuedEvent, key: DependencyKey, isNewArrival: boolean): void {
+    if (this.maxQueuedEvents <= 0 || this.maxQueuedEventsPerKey <= 0) {
+      this.counters.evicted += 1;
       return;
     }
 
-    if (this.queuedEvents.length >= this.maxQueuedEvents) {
-      this.queuedEvents.shift();
+    let bucket = this.pending.get(key);
+    if (!bucket) {
+      bucket = [];
+      this.pending.set(key, bucket);
     }
 
-    this.queuedEvents.push({
-      event,
-      expiresAt: now + this.queueTtlMs,
-    });
+    if (bucket.length >= this.maxQueuedEventsPerKey) {
+      bucket.shift();
+      this.pendingCount -= 1;
+      this.counters.evicted += 1;
+    } else if (this.pendingCount >= this.maxQueuedEvents) {
+      this.evictGloballyOldest();
+    }
+
+    bucket.push(queuedEvent);
+    this.pendingCount += 1;
+    if (isNewArrival) {
+      this.counters.queued += 1;
+    }
   }
 
-  /** Removes queued events whose dependencies did not arrive before the TTL. */
-  private expireQueuedEvents(now: number): void {
-    if (this.queuedEvents.length === 0) {
-      return;
-    }
+  /** Frees one slot by dropping the longest-waiting event across all buckets. */
+  private evictGloballyOldest(): void {
+    let oldestKey: DependencyKey | undefined;
+    let oldestBucket: QueuedEvent[] | undefined;
+    let oldestExpiry = Infinity;
 
-    const retained: QueuedEvent[] = [];
-    for (const queuedEvent of this.queuedEvents) {
-      if (queuedEvent.expiresAt > now) {
-        retained.push(queuedEvent);
+    for (const [key, bucket] of this.pending) {
+      const head = bucket[0];
+      if (head && head.expiresAt < oldestExpiry) {
+        oldestExpiry = head.expiresAt;
+        oldestKey = key;
+        oldestBucket = bucket;
       }
     }
 
-    this.queuedEvents = retained;
+    if (oldestKey === undefined || !oldestBucket) {
+      return;
+    }
+
+    oldestBucket.shift();
+    this.pendingCount -= 1;
+    this.counters.evicted += 1;
+    if (oldestBucket.length === 0) {
+      this.pending.delete(oldestKey);
+    }
   }
 
   /**
-   * Replays queued events until the latest installation/process discovery stops
-   * unlocking more pending records.
+   * Replays every event parked under a freshly resolved dependency. A replayed
+   * process.started that registers its pid flushes that pid's bucket in turn,
+   * so a single installation discovery still cascades to the run events behind
+   * it. Events still missing another dependency are re-parked under it with
+   * their original deadline.
    */
-  private retryQueuedEvents(): void {
-    let madeProgress = true;
+  private flushPending(key: DependencyKey): void {
+    const bucket = this.pending.get(key);
+    if (!bucket) {
+      return;
+    }
 
-    while (madeProgress) {
-      madeProgress = false;
-      this.expireQueuedEvents(Date.now());
+    this.pending.delete(key);
+    this.pendingCount -= bucket.length;
 
-      const unresolved: QueuedEvent[] = [];
-      for (const queuedEvent of this.queuedEvents) {
-        if (this.tryForward(queuedEvent.event)) {
-          madeProgress = true;
-        } else {
-          unresolved.push(queuedEvent);
-        }
+    const now = Date.now();
+    for (const queuedEvent of bucket) {
+      if (queuedEvent.expiresAt <= now) {
+        this.counters.expired += 1;
+        continue;
       }
 
-      this.queuedEvents = unresolved;
+      const result = this.tryForward(queuedEvent.event);
+      if (result.status === "waiting") {
+        this.park(queuedEvent, result.on, false);
+      }
     }
+  }
+
+  /** Logs one summary line whenever events were shed since the last report. */
+  private reportShedding(): void {
+    const shed = this.counters.expired + this.counters.evicted;
+    if (shed <= this.lastReportedShed) {
+      return;
+    }
+
+    console.error(`collector shed ${String(shed - this.lastReportedShed)} unresolved events (expired or evicted); ${String(this.pendingCount)} still pending`);
+    this.lastReportedShed = shed;
   }
 }
 
@@ -379,16 +544,23 @@ export class Collector {
   constructor(options: CollectorOptions = {}) {
     this.socketPath = options.socketPath ?? getQctlSocketPath();
     this.socketMode = options.socketMode;
-    this.router = new EventRouter(
-      options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()],
-      options.queueTtlMs ?? DEFAULT_QUEUE_TTL_MS,
-      options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS,
-    );
+    this.router = new EventRouter({
+      forwarders: options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()],
+      queueTtlMs: options.queueTtlMs ?? DEFAULT_QUEUE_TTL_MS,
+      maxQueuedEvents: options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS,
+      maxQueuedEventsPerKey: options.maxQueuedEventsPerKey ?? DEFAULT_MAX_QUEUED_EVENTS_PER_KEY,
+      processEvictionGraceMs: options.processEvictionGraceMs ?? DEFAULT_PROCESS_EVICTION_GRACE_MS,
+    });
   }
 
   /** Returns the socket file path that this collector binds when started. */
   get path(): string {
     return this.socketPath;
+  }
+
+  /** Returns routing counters and queue depth for health checks and tests. */
+  get stats(): CollectorStats {
+    return this.router.stats;
   }
 
   /** Returns the active socket server, if this instance currently owns one. */
@@ -430,6 +602,7 @@ export class Collector {
       await chmod(this.socketPath, this.socketMode);
     }
 
+    this.router.startSweeping();
     this.server = server;
     return server;
   }
@@ -441,6 +614,7 @@ export class Collector {
       return;
     }
 
+    this.router.stopSweeping();
     this.server = undefined;
 
     await new Promise<void>((resolve, reject) => {
