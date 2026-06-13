@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -eu
+
+# Perform only root-owned qctl setup during package installation. Per-user
+# qcontrol sink configuration is intentionally left to an explicit user command.
+
+/usr/local/bin/qctl install-system
+
+cat <<'EOF'
+qctl system setup complete.
+Run /usr/local/bin/qctl init-user as each user who should send qcontrol events to qctl.
+EOF

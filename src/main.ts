@@ -4,7 +4,7 @@
  */
 import { Collector } from "./collector";
 import { ConsoleForwarder } from "./forwarder";
-import { install, start, stop, uninstall } from "./installation";
+import { initUser, install, installSystem, start, stop, uninstall } from "./installation";
 import { runQcontrol } from "./qcontrol";
 import { Scanner } from "./scanner";
 
@@ -73,6 +73,10 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   switch (args[0]) {
     case "install":
       return install();
+    case "install-system":
+      return installSystem();
+    case "init-user":
+      return initUser();
     case "uninstall":
       return uninstall();
     case "start":

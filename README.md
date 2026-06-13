@@ -166,6 +166,33 @@ make update-qcontrol
 make clean
 ```
 
+Build the macOS installer package:
+
+```sh
+make pkg
+```
+
+The package is written to `dist/qctl-<version>.pkg` with package identifier `io.qpoint.qctl`. It installs the compiled wrapper at `/usr/local/bin/qctl` and runs a root-only `postinstall` hook that invokes `/usr/local/bin/qctl install-system`. That system setup runs `qcontrol init --system`, installs the root-owned LaunchDaemon/log/runtime assets, and points the daemon at `/var/run/qctl/collector.sock`. Per-user setup remains explicit: each user who should send qcontrol events to qctl should run `/usr/local/bin/qctl init-user`, which runs `qcontrol init --user` and appends qctl's sink to that user's `run.toml`.
+
+Inspect a package before installing it:
+
+```sh
+scripts/verify-pkg.sh dist/qctl-0.1.0.pkg
+pkgutil --payload-files dist/qctl-0.1.0.pkg
+```
+
+Install the package locally:
+
+```sh
+sudo installer -pkg dist/qctl-0.1.0.pkg -target /
+```
+
+Verify the installed binary:
+
+```sh
+/usr/local/bin/qctl --version
+```
+
 During development, `bun run dev -- <args>` runs the wrapper from source. Installation should be performed with the compiled binary unless `QCTL_EXECUTABLE` points at a compiled wrapper, because launchd must execute a stable binary path.
 
 ## Operator instructions
@@ -184,7 +211,7 @@ These instructions assume the custom forwarder has already been implemented and 
    ./bin/qctl install
    ```
 
-   The install command initializes qcontrol with sudo, appends qctl's socket sink to the user's qcontrol `run.toml`, and installs the root LaunchDaemon at `/Library/LaunchDaemons/com.qpoint.qctl.plist`.
+   The install command runs system setup with sudo, runs current-user setup, appends qctl's socket sink to the user's qcontrol `run.toml`, and installs the root LaunchDaemon at `/Library/LaunchDaemons/com.qpoint.qctl.plist`. Package installs perform only the system step; run `/usr/local/bin/qctl init-user` once per user after installing a package.
 
 3. Start the daemon:
 

@@ -14,7 +14,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { runQcontrolAsRoot } from "./qcontrol";
+import { runQcontrol, runQcontrolAsRoot, type RunQcontrolOptions } from "./qcontrol";
 
 const QCTL_SINK_MARKER = "# qctl run-event socket sink";
 const QCTL_CONFIG_DIR_ENV = "QCTL_CONFIG_DIR";
@@ -53,6 +53,11 @@ function defaultQctlSocketPath(): string {
   return join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
 }
 
+/** Resolves the stable socket path used by package-installed system daemons. */
+function systemQctlSocketPath(): string {
+  return join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
+}
+
 /** Escapes launchd plist string values without taking a dependency on plist IO. */
 function escapePlistString(value: string): string {
   return value
@@ -82,17 +87,49 @@ function getQctlExecutablePath(): string {
   return resolve(process.execPath);
 }
 
+/** Controls which qctl paths and environment variables are written to launchd. */
+interface LaunchDaemonPlistOptions {
+  includeUserConfigEnvironment?: boolean;
+  socketPath?: string;
+}
+
+/** Testable collaborators for lifecycle commands that mutate qcontrol or host state. */
+export interface InstallationDependencies {
+  appendQctlSinkConfig: () => Promise<void>;
+  installLaunchDaemon: (plist: string) => Promise<number>;
+  removeQctlSinkConfig: () => Promise<void>;
+  removeLaunchDaemon: () => Promise<number>;
+  runAsRoot: (command: string[], stdio?: Bun.SpawnOptions.Readable) => Promise<number>;
+  runQcontrol: (options?: RunQcontrolOptions) => Promise<number>;
+  runQcontrolAsRoot: (options?: RunQcontrolOptions) => Promise<number>;
+}
+
+/** Lifecycle commands plus their collaborators, exposed for focused unit tests. */
+export interface InstallationActions {
+  dependencies: InstallationDependencies;
+  install: () => Promise<number>;
+  installSystem: () => Promise<number>;
+  initUser: () => Promise<number>;
+  start: () => Promise<number>;
+  stop: () => Promise<number>;
+  uninstall: () => Promise<number>;
+}
+
 /** Builds the root LaunchDaemon plist that runs qctl's daemon command in place. */
-function buildLaunchDaemonPlist(): string {
+function buildLaunchDaemonPlist(options: LaunchDaemonPlistOptions = {}): string {
   const configDir = defaultQcontrolConfigDir();
+  const includeUserConfigEnvironment = options.includeUserConfigEnvironment ?? true;
   const values = {
     executable: escapePlistString(getQctlExecutablePath()),
     configDir: escapePlistString(configDir),
-    socketPath: escapePlistString(getQctlSocketPath()),
+    socketPath: escapePlistString(options.socketPath ?? getQctlSocketPath()),
     xdgConfigHome: escapePlistString(dirname(configDir)),
     stdoutPath: escapePlistString(join(LAUNCHD_LOG_DIR, "stdout.log")),
     stderrPath: escapePlistString(join(LAUNCHD_LOG_DIR, "stderr.log")),
   };
+  const userConfigEnvironment = includeUserConfigEnvironment
+    ? `    <key>${QCTL_CONFIG_DIR_ENV}</key>\n    <string>${values.configDir}</string>\n    <key>XDG_CONFIG_HOME</key>\n    <string>${values.xdgConfigHome}</string>\n`
+    : "";
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -107,12 +144,8 @@ function buildLaunchDaemonPlist(): string {
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>${QCTL_CONFIG_DIR_ENV}</key>
-    <string>${values.configDir}</string>
-    <key>${QCTL_SOCKET_PATH_ENV}</key>
+${userConfigEnvironment}    <key>${QCTL_SOCKET_PATH_ENV}</key>
     <string>${values.socketPath}</string>
-    <key>XDG_CONFIG_HOME</key>
-    <string>${values.xdgConfigHome}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -377,52 +410,103 @@ async function removeQctlSinkConfig(): Promise<void> {
   await writeFile(runConfigPath, updated.config, "utf8");
 }
 
-/** Initializes qcontrol with elevated privileges, then installs qctl's sink hook. */
-export async function install(): Promise<number> {
-  const launchDaemonPlist = buildLaunchDaemonPlist();
-  const initExitCode = await runQcontrolAsRoot({ args: ["init"] });
-  if (initExitCode !== 0) {
-    return initExitCode;
-  }
+/** Creates lifecycle helpers around explicit dependencies for focused tests. */
+export function createInstallationActions(
+  dependencies: InstallationDependencies,
+): InstallationActions {
+  const installSystem = async (): Promise<number> => {
+    const initExitCode = await dependencies.runQcontrolAsRoot({ args: ["init", "--system"] });
+    if (initExitCode !== 0) {
+      return initExitCode;
+    }
 
-  await appendQctlSinkConfig();
-  return installLaunchDaemon(launchDaemonPlist);
+    return dependencies.installLaunchDaemon(buildLaunchDaemonPlist({
+      includeUserConfigEnvironment: false,
+      socketPath: systemQctlSocketPath(),
+    }));
+  };
+
+  const initUser = async (): Promise<number> => {
+    const initExitCode = await dependencies.runQcontrol({ args: ["init", "--user"] });
+    if (initExitCode !== 0) {
+      return initExitCode;
+    }
+
+    await dependencies.appendQctlSinkConfig();
+    return 0;
+  };
+
+  const install = async (): Promise<number> => {
+    const systemExitCode = await installSystem();
+    if (systemExitCode !== 0) {
+      return systemExitCode;
+    }
+
+    return initUser();
+  };
+
+  const uninstall = async (): Promise<number> => {
+    const launchDaemonExitCode = await dependencies.removeLaunchDaemon();
+    if (launchDaemonExitCode !== 0) {
+      return launchDaemonExitCode;
+    }
+
+    await dependencies.removeQctlSinkConfig();
+    // return dependencies.runQcontrolAsRoot({ args: ["deinit"] });
+    return 0;
+  };
+
+  const start = async (): Promise<number> => {
+    if (!(await isLaunchDaemonLoaded())) {
+      const bootstrapExitCode = await dependencies.runAsRoot([
+        "launchctl",
+        "bootstrap",
+        "system",
+        LAUNCH_DAEMON_PATH,
+      ]);
+      if (bootstrapExitCode !== 0) {
+        return bootstrapExitCode;
+      }
+    }
+
+    return dependencies.runAsRoot(["launchctl", "kickstart", "-k", LAUNCH_DAEMON_TARGET]);
+  };
+
+  const stop = async (): Promise<number> => {
+    if (!(await isLaunchDaemonLoaded())) {
+      return 0;
+    }
+
+    return dependencies.runAsRoot(["launchctl", "bootout", LAUNCH_DAEMON_TARGET]);
+  };
+
+  return { dependencies, install, installSystem, initUser, start, stop, uninstall };
 }
+
+const defaultInstallationActions = createInstallationActions({
+  appendQctlSinkConfig,
+  installLaunchDaemon,
+  removeQctlSinkConfig,
+  removeLaunchDaemon,
+  runAsRoot,
+  runQcontrol,
+  runQcontrolAsRoot,
+});
+
+/** Installs root-owned host assets without mutating per-user qcontrol state. */
+export const installSystem = defaultInstallationActions.installSystem;
+
+/** Initializes the current user's qcontrol trust and qctl sink configuration. */
+export const initUser = defaultInstallationActions.initUser;
+
+/** Initializes system assets, then installs qctl's current-user sink hook. */
+export const install = defaultInstallationActions.install;
 
 /** Removes qctl's sink hook, then deinitializes qcontrol host integration. */
-export async function uninstall(): Promise<number> {
-  const launchDaemonExitCode = await removeLaunchDaemon();
-  if (launchDaemonExitCode !== 0) {
-    return launchDaemonExitCode;
-  }
-
-  await removeQctlSinkConfig();
-  // return runQcontrolAsRoot({ args: ["deinit"] });
-  return 0;
-}
+export const uninstall = defaultInstallationActions.uninstall;
 
 /** Loads the root LaunchDaemon and asks launchd to run the daemon immediately. */
-export async function start(): Promise<number> {
-  if (!(await isLaunchDaemonLoaded())) {
-    const bootstrapExitCode = await runAsRoot([
-      "launchctl",
-      "bootstrap",
-      "system",
-      LAUNCH_DAEMON_PATH,
-    ]);
-    if (bootstrapExitCode !== 0) {
-      return bootstrapExitCode;
-    }
-  }
-
-  return runAsRoot(["launchctl", "kickstart", "-k", LAUNCH_DAEMON_TARGET]);
-}
+export const start = defaultInstallationActions.start;
 
 /** Unloads the root LaunchDaemon so KeepAlive cannot restart the scanner. */
-export async function stop(): Promise<number> {
-  if (!(await isLaunchDaemonLoaded())) {
-    return 0;
-  }
-
-  return runAsRoot(["launchctl", "bootout", LAUNCH_DAEMON_TARGET]);
-}
+export const stop = defaultInstallationActions.stop;
