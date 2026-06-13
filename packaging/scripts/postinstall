@@ -9,5 +9,5 @@ set -eu
 
 cat <<'EOF'
 qctl system setup complete.
-Run /usr/local/bin/qctl init-user as each user who should send qcontrol events to qctl once user initialization is available.
+Run /usr/local/bin/qctl init-user as each user who should send qcontrol events to qctl.
 EOF
