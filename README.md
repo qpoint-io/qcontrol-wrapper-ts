@@ -7,8 +7,8 @@ The default implementation already handles the parts that should not need to be 
 - bundles and materializes the upstream `qcontrol` binary
 - proxies unknown CLI commands through to `qcontrol`
 - installs a macOS LaunchDaemon for the long-running scanner
-- configures qcontrol's run-event Unix socket sink
-- collects newline-delimited JSON records from that socket
+- configures qcontrol's run-event local sink
+- collects newline-delimited JSON records from that socket or named pipe
 - resolves installation and process context before delivery
 - forwards complete event records to one or more `Forwarder` implementations
 
@@ -26,8 +26,8 @@ Any other arguments are passed through to the embedded `qcontrol` binary unchang
 
 At runtime the daemon starts two components:
 
-1. `Collector` listens on qctl's Unix socket sink.
-2. `Scanner` runs `qcontrol scan --processes --watch --sink <socket>`.
+1. `Collector` listens on qctl's local sink.
+2. `Scanner` runs `qcontrol scan --processes --watch --sink <local-sink-url>`.
 
 The collector receives qcontrol's socket records, parses each JSON event, resolves dependency records, and calls the configured forwarders.
 
@@ -76,7 +76,7 @@ Then wire it into `daemon()` in `src/main.ts`:
 const forwarder = new CustomForwarder();
 const collector = new Collector({
   forwarders: [forwarder],
-  socketMode: shouldOpenDaemonSocket() ? 0o666 : undefined,
+  socketMode: platformAdapter.shouldOpenDaemonEndpoint() ? 0o666 : undefined,
 });
 ```
 
@@ -156,6 +156,8 @@ make build
 ```
 
 `make build` ensures `vendor/qcontrol.bin` exists, downloading qcontrol when needed, then compiles the wrapper to `bin/qctl`.
+
+On Windows, upstream qcontrol builds are not published yet. Copy the `qcontrol.exe` binary manually into `vendor\qcontrol.bin`.
 
 Useful development commands:
 
@@ -242,13 +244,15 @@ These instructions assume the custom forwarder has already been implemented and 
 
 The daemon socket defaults to `/var/run/qctl/collector.sock`. qcontrol run configuration defaults to `$XDG_CONFIG_HOME/qcontrol/run.toml` or `~/.config/qcontrol/run.toml`.
 
+On Windows, the MVP runtime uses the named-pipe sink `pipe://qctl-collector`, backed by `\\.\pipe\qctl-collector`. Proxy/pass-through commands and foreground `qctl daemon` are supported. Windows service lifecycle commands are intentionally not implemented yet: `install`, `install-system`, `start`, `stop`, and `uninstall` print an unsupported message and return a non-zero exit code.
+
 ## Configuration overrides
 
 The wrapper supports these environment variables for integration and deployment work:
 
 - `QCTL_EXECUTABLE`: compiled qctl binary path to write into the LaunchDaemon plist during install.
 - `QCTL_CONFIG_DIR`: qcontrol config directory used by install and the daemon.
-- `QCTL_SOCKET_PATH`: Unix socket path used by the collector and qcontrol sink config.
+- `QCTL_SOCKET_PATH`: local collector endpoint path used by the collector and qcontrol sink config. On Windows, a short pipe name such as `qctl-collector` is normalized to `\\.\pipe\qctl-collector`.
 - `QCONTROL_WRAPPER_CACHE_DIR`: cache root where the embedded qcontrol binary is materialized.
 - `VERSION`: qcontrol version used by `scripts/download-qcontrol.sh`; defaults to `latest`.
 

@@ -5,13 +5,10 @@
 import { Collector } from "./collector";
 import { ConsoleForwarder } from "./forwarder";
 import { initUser, install, installSystem, start, stop, uninstall } from "./installation";
+import { platformAdapter } from "./platform";
 import { runQcontrol } from "./qcontrol";
 import { Scanner } from "./scanner";
 
-/** Detects the root-owned launchd runtime that must share its socket with users. */
-function shouldOpenDaemonSocket(): boolean {
-  return process.getuid?.() === 0;
-}
 
 /**
  * Starts qctl's local event pipeline by binding the collector socket before the
@@ -21,7 +18,7 @@ export async function daemon(): Promise<number> {
   const forwarder = new ConsoleForwarder();
   const collector = new Collector({
     forwarders: [forwarder],
-    socketMode: shouldOpenDaemonSocket() ? 0o666 : undefined,
+    socketMode: platformAdapter.shouldOpenDaemonEndpoint() ? 0o666 : undefined,
   });
   const scanner = new Scanner();
 

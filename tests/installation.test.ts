@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import { createInstallationActions } from "../src/installation";
+import { createPlatformAdapter } from "../src/platform";
 
 beforeEach(() => {
   process.env.QCTL_EXECUTABLE = "/usr/local/bin/qctl";
@@ -31,7 +32,7 @@ function createActions() {
       rootCommands.push(command);
       return 0;
     },
-  });
+  }, createPlatformAdapter("darwin"));
 
   return { actions, configWrites, qcontrolCalls, rootCommands, rootQcontrolCalls };
 }
@@ -55,7 +56,7 @@ describe("installation split init", () => {
         return 0;
       },
       runAsRoot: async () => 0,
-    });
+    }, createPlatformAdapter("darwin"));
 
     const exitCode = await actions.installSystem();
 
@@ -80,7 +81,7 @@ describe("installation split init", () => {
         return 42;
       },
       runAsRoot: async () => 0,
-    });
+    }, createPlatformAdapter("darwin"));
 
     const exitCode = await actions.installSystem();
 
@@ -105,7 +106,7 @@ describe("installation split init", () => {
       },
       runQcontrolAsRoot: async () => 0,
       runAsRoot: async () => 0,
-    });
+    }, createPlatformAdapter("darwin"));
 
     const exitCode = await actions.initUser();
 
@@ -145,11 +146,61 @@ describe("installation split init", () => {
         return 0;
       },
       runAsRoot: async () => 0,
-    });
+    }, createPlatformAdapter("darwin"));
 
     const exitCode = await actions.install();
 
     expect(exitCode).toBe(0);
     expect(order).toEqual(["qcontrol-system", "launchd", "qcontrol-user", "sink"]);
+  });
+
+  test("Windows lifecycle commands report unsupported without mutating host state", async () => {
+    const { actions, rootCommands, rootQcontrolCalls } = createActions();
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (message?: unknown) => {
+      errors.push(String(message));
+    };
+
+    const windowsActions = createInstallationActions(actions.dependencies, createPlatformAdapter("win32"));
+    try {
+      await expect(windowsActions.install()).resolves.toBe(1);
+      await expect(windowsActions.installSystem()).resolves.toBe(1);
+      await expect(windowsActions.start()).resolves.toBe(1);
+      await expect(windowsActions.stop()).resolves.toBe(1);
+      await expect(windowsActions.uninstall()).resolves.toBe(1);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(rootCommands).toEqual([]);
+    expect(rootQcontrolCalls).toEqual([]);
+    expect(errors).toContain("qctl install is not supported on Windows; run qctl daemon in the foreground instead.");
+    expect(errors).toContain("qctl start is not supported on Windows; run qctl daemon in the foreground instead.");
+  });
+
+  test("Linux lifecycle commands report unsupported without using launchd", async () => {
+    const { actions, rootCommands, rootQcontrolCalls } = createActions();
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (message?: unknown) => {
+      errors.push(String(message));
+    };
+
+    const linuxActions = createInstallationActions(actions.dependencies, createPlatformAdapter("linux"));
+    try {
+      await expect(linuxActions.install()).resolves.toBe(1);
+      await expect(linuxActions.installSystem()).resolves.toBe(1);
+      await expect(linuxActions.start()).resolves.toBe(1);
+      await expect(linuxActions.stop()).resolves.toBe(1);
+      await expect(linuxActions.uninstall()).resolves.toBe(1);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(rootCommands).toEqual([]);
+    expect(rootQcontrolCalls).toEqual([]);
+    expect(errors).toContain("qctl install is not supported on Linux; run qctl daemon in the foreground instead.");
+    expect(errors).toContain("qctl start is not supported on Linux; run qctl daemon in the foreground instead.");
   });
 });

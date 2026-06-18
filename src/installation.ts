@@ -12,9 +12,15 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 
-import { runQcontrol, runQcontrolAsRoot, type RunQcontrolOptions } from "./qcontrol";
+import { runQcontrol, runQcontrolAsRoot } from "./qcontrol";
+import { createLinuxLifecycleActions } from "./lifecycle/linux";
+import { createMacosLifecycleActions } from "./lifecycle/macos";
+import { type InstallationActions, type InstallationDependencies } from "./lifecycle/types";
+import { createWindowsLifecycleActions } from "./lifecycle/windows";
+import { createPlatformAdapter, platformAdapter, type PlatformAdapter } from "./platform";
+
+export type { InstallationActions, InstallationDependencies } from "./lifecycle/types";
 
 const QCTL_SINK_MARKER = "# qctl run-event socket sink";
 const QCTL_CONFIG_DIR_ENV = "QCTL_CONFIG_DIR";
@@ -44,13 +50,9 @@ function legacyQctlSocketPath(): string {
   return join(defaultQcontrolConfigDir(), "qctl.sock");
 }
 
-/** Resolves qctl's runtime socket outside persistent qcontrol configuration. */
-function defaultQctlSocketPath(): string {
-  if (process.env[QCTL_SOCKET_PATH_ENV]) {
-    return process.env[QCTL_SOCKET_PATH_ENV];
-  }
-
-  return join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
+/** Adapts legacy helper inputs to the shared platform contract. */
+function platformAdapterFor(platform: NodeJS.Platform | PlatformAdapter): PlatformAdapter {
+  return typeof platform === "string" ? createPlatformAdapter(platform) : platform;
 }
 
 /** Resolves the stable socket path used by package-installed system daemons. */
@@ -91,28 +93,6 @@ function getQctlExecutablePath(): string {
 interface LaunchDaemonPlistOptions {
   includeUserConfigEnvironment?: boolean;
   socketPath?: string;
-}
-
-/** Testable collaborators for lifecycle commands that mutate qcontrol or host state. */
-export interface InstallationDependencies {
-  appendQctlSinkConfig: () => Promise<void>;
-  installLaunchDaemon: (plist: string) => Promise<number>;
-  removeQctlSinkConfig: () => Promise<void>;
-  removeLaunchDaemon: () => Promise<number>;
-  runAsRoot: (command: string[], stdio?: Bun.SpawnOptions.Readable) => Promise<number>;
-  runQcontrol: (options?: RunQcontrolOptions) => Promise<number>;
-  runQcontrolAsRoot: (options?: RunQcontrolOptions) => Promise<number>;
-}
-
-/** Lifecycle commands plus their collaborators, exposed for focused unit tests. */
-export interface InstallationActions {
-  dependencies: InstallationDependencies;
-  install: () => Promise<number>;
-  installSystem: () => Promise<number>;
-  initUser: () => Promise<number>;
-  start: () => Promise<number>;
-  stop: () => Promise<number>;
-  uninstall: () => Promise<number>;
 }
 
 /** Builds the root LaunchDaemon plist that runs qctl's daemon command in place. */
@@ -263,22 +243,21 @@ export function getQcontrolRunConfigPath(): string {
   return join(defaultQcontrolConfigDir(), "run.toml");
 }
 
-/** Returns the Unix socket path where qctl listens for qcontrol run events. */
-export function getQctlSocketPath(): string {
-  return defaultQctlSocketPath();
+/** Returns the local endpoint path where qctl listens for qcontrol events. */
+export function getQctlSocketPath(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string {
+  return platformAdapterFor(platform).defaultCollectorEndpoint(process.env);
 }
 
-/** Formats the socket path as the URL string expected by qcontrol sinks. */
-export function getQctlSinkUrl(): string {
-  return `unix://${pathToFileURL(getQctlSocketPath()).pathname}`;
+/** Formats the local endpoint as the URL string expected by qcontrol sinks. */
+export function getQctlSinkUrl(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string {
+  const adapter = platformAdapterFor(platform);
+  return adapter.sinkUrl(getQctlSocketPath(adapter));
 }
 
 /** Returns qctl socket URLs that should be treated as wrapper-owned sinks. */
-function getQctlSinkUrls(): string[] {
-  return [
-    getQctlSinkUrl(),
-    `unix://${pathToFileURL(legacyQctlSocketPath()).pathname}`,
-  ];
+function getQctlSinkUrls(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string[] {
+  const adapter = platformAdapterFor(platform);
+  return adapter.qctlSinkUrls(getQctlSocketPath(adapter), legacyQctlSocketPath());
 }
 
 /** Narrows filesystem failures to Node errno errors without trusting throws. */
@@ -413,74 +392,26 @@ async function removeQctlSinkConfig(): Promise<void> {
 /** Creates lifecycle helpers around explicit dependencies for focused tests. */
 export function createInstallationActions(
   dependencies: InstallationDependencies,
+  platform: NodeJS.Platform | PlatformAdapter = platformAdapter,
 ): InstallationActions {
-  const installSystem = async (): Promise<number> => {
-    const initExitCode = await dependencies.runQcontrolAsRoot({ args: ["init", "--system"] });
-    if (initExitCode !== 0) {
-      return initExitCode;
-    }
+  const adapter = platformAdapterFor(platform);
 
-    return dependencies.installLaunchDaemon(buildLaunchDaemonPlist({
-      includeUserConfigEnvironment: false,
-      socketPath: systemQctlSocketPath(),
-    }));
-  };
+  if (adapter.kind === "windows") {
+    return createWindowsLifecycleActions(dependencies);
+  }
 
-  const initUser = async (): Promise<number> => {
-    const initExitCode = await dependencies.runQcontrol({ args: ["init", "--user"] });
-    if (initExitCode !== 0) {
-      return initExitCode;
-    }
+  if (adapter.kind === "linux") {
+    return createLinuxLifecycleActions(dependencies);
+  }
 
-    await dependencies.appendQctlSinkConfig();
-    return 0;
-  };
-
-  const install = async (): Promise<number> => {
-    const systemExitCode = await installSystem();
-    if (systemExitCode !== 0) {
-      return systemExitCode;
-    }
-
-    return initUser();
-  };
-
-  const uninstall = async (): Promise<number> => {
-    const launchDaemonExitCode = await dependencies.removeLaunchDaemon();
-    if (launchDaemonExitCode !== 0) {
-      return launchDaemonExitCode;
-    }
-
-    await dependencies.removeQctlSinkConfig();
-    // return dependencies.runQcontrolAsRoot({ args: ["deinit"] });
-    return 0;
-  };
-
-  const start = async (): Promise<number> => {
-    if (!(await isLaunchDaemonLoaded())) {
-      const bootstrapExitCode = await dependencies.runAsRoot([
-        "launchctl",
-        "bootstrap",
-        "system",
-        LAUNCH_DAEMON_PATH,
-      ]);
-      if (bootstrapExitCode !== 0) {
-        return bootstrapExitCode;
-      }
-    }
-
-    return dependencies.runAsRoot(["launchctl", "kickstart", "-k", LAUNCH_DAEMON_TARGET]);
-  };
-
-  const stop = async (): Promise<number> => {
-    if (!(await isLaunchDaemonLoaded())) {
-      return 0;
-    }
-
-    return dependencies.runAsRoot(["launchctl", "bootout", LAUNCH_DAEMON_TARGET]);
-  };
-
-  return { dependencies, install, installSystem, initUser, start, stop, uninstall };
+  return createMacosLifecycleActions({
+    buildLaunchDaemonPlist,
+    dependencies,
+    isLaunchDaemonLoaded,
+    launchDaemonPath: LAUNCH_DAEMON_PATH,
+    launchDaemonTarget: LAUNCH_DAEMON_TARGET,
+    systemQctlSocketPath,
+  });
 }
 
 const defaultInstallationActions = createInstallationActions({
