@@ -10,6 +10,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { connect } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -252,6 +253,35 @@ export function getQctlSocketPath(platform: NodeJS.Platform | PlatformAdapter = 
 export function getQctlSinkUrl(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string {
   const adapter = platformAdapterFor(platform);
   return adapter.sinkUrl(getQctlSocketPath(adapter));
+}
+
+/** Detects whether qctl's local collector endpoint is currently accepting connections. */
+export async function isQctlSinkAvailable(
+  platform: NodeJS.Platform | PlatformAdapter = platformAdapter,
+  timeoutMs = 15,
+): Promise<boolean> {
+  const endpointPath = getQctlSocketPath(platform);
+
+  return new Promise((resolve) => {
+    const socket = connect(endpointPath);
+    let settled = false;
+
+    const finish = (available: boolean) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(available);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false));
+  });
 }
 
 /** Returns qctl socket URLs that should be treated as wrapper-owned sinks. */

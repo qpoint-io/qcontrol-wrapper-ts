@@ -22,7 +22,11 @@ The default implementation already handles the parts that should not need to be 
 - `qctl stop`
 - `qctl daemon`
 
-Any other arguments are passed through to the embedded `qcontrol` binary unchanged.
+Most other arguments are passed through to the embedded `qcontrol` binary unchanged.
+When `qctl run` is used without an explicit `--sink`, the wrapper first checks
+whether the local daemon collector is already accepting connections. If it is,
+the run is forwarded with qctl's local sink as the default destination; otherwise
+the command is passed through unchanged.
 
 At runtime the daemon starts two components:
 
