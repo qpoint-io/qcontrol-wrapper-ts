@@ -143,6 +143,15 @@ The files are auto-generated from qcontrol's event schemas and updated together 
 
 ## Development
 
+Developer prerequisites:
+
+- Bun for dependency installation, tests, and compiled wrapper builds.
+- Make plus the platform package tools for the targets you build. macOS packaging uses Apple's `pkgbuild` and `pkgutil`.
+- Windows MSI packaging uses PowerShell, `msiexec`, the .NET 8 SDK, and the repo-pinned WiX .NET tool from `.config/dotnet-tools.json`. Install the SDK with `winget install --id Microsoft.DotNet.SDK.8 --source winget --scope machine`, then open a new terminal or refresh `PATH`.
+- Windows qcontrol upstream builds are not published yet, so Windows wrapper/MSI builds require a manually supplied `vendor\qcontrol.bin`.
+
+The .NET SDK and WiX are development-only requirements for building the MSI. They are not runtime requirements for machines that install and run `qctl.exe` from the MSI.
+
 Install dependencies:
 
 ```sh
@@ -167,6 +176,30 @@ bun run dev -- --help
 make update-qcontrol
 make clean
 ```
+
+Build the Windows MSI installer package:
+
+```powershell
+Copy-Item C:\Users\User\code\qcontrol\bin\qcontrol.exe vendor\qcontrol.bin
+bun run build:msi
+bun run verify:msi
+```
+
+Windows MSI builds require Bun, the .NET 8 SDK, and the repo-pinned WiX 5.0.2 local tool restored from `.config/dotnet-tools.json`. The MSI is written to `dist\qctl-<version>-windows-x64.msi`. It installs `qctl.exe` to `C:\Program Files\qctl\qctl.exe` and adds `C:\Program Files\qctl` to the system `PATH`; open a new terminal before relying on the updated `PATH`. Manual installs and uninstalls show a completion page; quiet installs do not display UI.
+
+The Windows MSI does not download `qcontrol.exe`, install it as a separate file, run `qctl init-user`, register a Windows Service, or run `qctl install-system`. Windows upstream qcontrol builds are not published yet, so `vendor\qcontrol.bin` remains a manual local prerequisite and is embedded into the compiled wrapper by Bun.
+
+Install and uninstall the Windows MSI locally:
+
+```powershell
+msiexec /i dist\qctl-0.1.0-windows-x64.msi /L*v dist\install.log
+& "$env:ProgramFiles\qctl\qctl.exe" --version
+qctl --version
+qctl init-user
+msiexec /x dist\qctl-0.1.0-windows-x64.msi /L*v dist\uninstall.log
+```
+
+Run `qctl init-user` separately as each Windows user whose qcontrol configuration should send events to qctl. On Windows, service lifecycle commands are intentionally unsupported in this MVP; run `qctl daemon` in the foreground until Windows Service support lands in a later PR.
 
 Build the macOS installer package:
 

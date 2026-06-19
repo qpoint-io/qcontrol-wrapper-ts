@@ -7,6 +7,8 @@
     "dev": "bun run src/main.ts",
     "build": "bun build src/main.ts --compile --outfile bin/qctl",
     "build:win": "bun build src/main.ts --compile --outfile bin/qctl.exe",
+    "build:msi": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-msi.ps1",
+    "verify:msi": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-msi.ps1",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

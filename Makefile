@@ -14,7 +14,7 @@ BINARY := qctl$(EXE_SUFFIX)
 
 .DEFAULT_GOAL := build
 
-.PHONY: dev build qcontrol update-qcontrol pkg clean
+.PHONY: dev build qcontrol update-qcontrol pkg msi clean
 
 build: qcontrol
 	mkdir -p $(BIN_DIR)
@@ -42,6 +42,9 @@ endif
 
 pkg:
 	./scripts/build-pkg.sh
+
+msi:
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-msi.ps1
 
 clean:
 	rm -rf $(BIN_DIR)

@@ -1,0 +1,81 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="qctl"
+    Manufacturer="Qpoint"
+    Version="$(var.ProductVersion)"
+    Scope="perMachine"
+    UpgradeCode="{c2ee0688-5f8a-451f-8686-84e96738cd42}">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of qctl is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Property
+      Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+      Value="Run qctl init-user as each Windows user who should send qcontrol events to qctl." />
+    <UIRef Id="QctlWixUI_NoLicense" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="qctl">
+        <Component Id="QctlExecutable" Guid="{2765fa4c-b76e-437a-b456-7ed184b1b802}" Bitness="always64">
+          <File Id="QctlExe" Source="$(var.QctlExePath)" Name="qctl.exe" KeyPath="yes" />
+          <Environment
+            Id="QctlPath"
+            Name="PATH"
+            Value="[INSTALLFOLDER]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="yes" />
+          <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="qctl" Level="1">
+      <ComponentRef Id="QctlExecutable" />
+    </Feature>
+
+    <SetProperty
+      Id="WixUI_InstallMode"
+      Value="Remove"
+      Before="CostFinalize"
+      Sequence="ui"
+      Condition="REMOVE=&quot;ALL&quot; AND Installed AND NOT UPGRADINGPRODUCTCODE" />
+    <InstallUISequence>
+      <Show
+        Dialog="VerifyReadyDlg"
+        Before="ProgressDlg"
+        Condition="REMOVE=&quot;ALL&quot; AND Installed AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallUISequence>
+  </Package>
+
+  <Fragment>
+    <UI Id="QctlWixUI_NoLicense">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Segoe UI" Size="9" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Segoe UI" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Segoe UI" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="1" Condition="NOT Installed OR (Installed AND PATCH)" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+      <Property Id="ARPNOMODIFY" Value="1" />
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>
