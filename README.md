@@ -147,6 +147,15 @@ The files are auto-generated from qcontrol's event schemas and updated together 
 
 ## Development
 
+Developer prerequisites:
+
+- Bun for dependency installation, tests, and compiled wrapper builds.
+- Make plus the platform package tools for the targets you build. macOS packaging uses Apple's `pkgbuild` and `pkgutil`.
+- Windows installer packaging uses PowerShell and Inno Setup 6. Install Inno Setup with `winget install --id JRSoftware.InnoSetup --source winget`, then open a new terminal or refresh `PATH`.
+- Windows qcontrol upstream builds are not published yet, so Windows wrapper and installer builds require a manually supplied `bin\qcontrol.bin`.
+
+Inno Setup is a development-only requirement for building the Windows installer. It is not a runtime requirement for machines that install and run `qctl.exe`.
+
 Install dependencies:
 
 ```sh
@@ -159,9 +168,9 @@ Build the wrapper binary:
 make build
 ```
 
-`make build` ensures `vendor/qcontrol.bin` exists, downloading qcontrol when needed, then compiles the wrapper to `bin/qctl`.
+`make build` ensures `bin/qcontrol.bin` exists, downloading qcontrol when needed, then compiles the wrapper to `bin/qctl`.
 
-On Windows, upstream qcontrol builds are not published yet. Copy the `qcontrol.exe` binary manually into `vendor\qcontrol.bin`.
+On Windows, upstream qcontrol builds are not published yet. Copy the built qcontrol binary manually into `bin\qcontrol.bin`.
 
 Useful development commands:
 
@@ -171,6 +180,31 @@ bun run dev -- --help
 make update-qcontrol
 make clean
 ```
+
+Build the Windows installer:
+
+```powershell
+# Manually copy the built qcontrol binary to bin\qcontrol.bin first.
+bun run build:win-installer
+bun run verify:win-installer
+```
+
+The Windows installer is written to `dist\qctl-<version>-windows-x64-setup.exe`. It installs `qctl.exe` to `C:\Program Files\qctl\qctl.exe` and adds `C:\Program Files\qctl` to the system `PATH`; open a new terminal before relying on the updated `PATH`. The installer requires administrator rights and Windows 10 or newer.
+
+The Windows installer does not download `qcontrol.exe`, install it as a separate file, register a Windows Service, or run `qctl install-system`. Windows upstream qcontrol builds are not published yet, so `bin\qcontrol.bin` remains a manual local prerequisite and is embedded into the compiled wrapper by Bun.
+
+Install and uninstall the Windows installer locally:
+
+```powershell
+dist\qctl-0.1.0-windows-x64-setup.exe /LOG=dist\install.log
+& "$env:ProgramFiles\qctl\qctl.exe" --version
+qctl --version
+& "$env:ProgramFiles\qctl\unins000.exe" /LOG=dist\uninstall.log
+```
+
+Run `qctl init-user` as each user who should send qcontrol events to qctl.
+
+On Windows, service lifecycle commands are intentionally unsupported in this MVP; run `qctl daemon` in the foreground until Windows Service support lands in a later PR.
 
 Build the macOS installer package:
 

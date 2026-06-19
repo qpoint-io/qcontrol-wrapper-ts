@@ -5,7 +5,7 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import embeddedQcontrolPath from "../vendor/qcontrol.bin" with { type: "file" };
+import embeddedQcontrolPath from "../bin/qcontrol.bin" with { type: "file" };
 import { createPlatformAdapter, platformAdapter, type PlatformAdapter } from "./platform";
 
 /** Controls where the embedded qcontrol executable is materialized. */

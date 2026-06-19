@@ -5,7 +5,7 @@ set -eu
 # Download URL format mirrors https://get.qpoint.io/qcontrol/download.
 
 VERSION=${VERSION:-latest}
-OUTPUT=${1:-vendor/qcontrol.bin}
+OUTPUT=${1:-bin/qcontrol.bin}
 
 OS=
 ARCH=
