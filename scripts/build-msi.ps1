@@ -1,7 +1,7 @@
 param(
   [ValidateSet("x64")]
   [string] $Architecture = "x64",
-  [string] $QcontrolBinary = "vendor\qcontrol.bin",
+  [string] $QcontrolBinary = "bin\qcontrol.bin",
   [string] $OutputDirectory = "dist"
 )
 
@@ -51,7 +51,7 @@ try {
     throw @"
 Missing $QcontrolBinary.
 Windows qcontrol builds are not published yet. Run:
-Copy-Item C:\Users\User\code\qcontrol\bin\qcontrol.exe vendor\qcontrol.bin
+Copy the built qcontrol binary to bin\qcontrol.bin.
 "@
   }
 

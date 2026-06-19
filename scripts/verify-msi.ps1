@@ -135,7 +135,7 @@ Assert-Equal "ProductVersion" (Get-MsiProperty $database "ProductVersion") $Expe
 Assert-Equal "UpgradeCode" (Get-MsiProperty $database "UpgradeCode") "{C2EE0688-5F8A-451F-8686-84E96738CD42}"
 Assert-Equal "WIXUI_EXITDIALOGOPTIONALTEXT" `
   (Get-MsiProperty $database "WIXUI_EXITDIALOGOPTIONALTEXT") `
-  "Run qctl init-user as each Windows user who should send qcontrol events to qctl."
+  "Run qctl init-user as each user who should send qcontrol events to qctl."
 
 $directories = Get-MsiRows $database "SELECT Directory, DefaultDir FROM Directory" 2
 $installFolder = $directories | Where-Object { $_[0] -eq "INSTALLFOLDER" } | Select-Object -First 1

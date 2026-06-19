@@ -9,7 +9,7 @@
     <MediaTemplate EmbedCab="yes" />
     <Property
       Id="WIXUI_EXITDIALOGOPTIONALTEXT"
-      Value="Run qctl init-user as each Windows user who should send qcontrol events to qctl." />
+      Value="Run qctl init-user as each user who should send qcontrol events to qctl." />
     <UIRef Id="QctlWixUI_NoLicense" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
