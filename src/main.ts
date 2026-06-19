@@ -4,11 +4,30 @@
  */
 import { Collector } from "./collector";
 import { ConsoleForwarder } from "./forwarder";
-import { initUser, install, installSystem, start, stop, uninstall } from "./installation";
+import {
+  getQctlSinkUrl,
+  initUser,
+  install,
+  installSystem,
+  isQctlSinkAvailable,
+  start,
+  stop,
+  uninstall,
+} from "./installation";
 import { platformAdapter } from "./platform";
 import { runQcontrol } from "./qcontrol";
 import { Scanner } from "./scanner";
 
+/** Collaborators used by main so pass-through behavior remains unit-testable. */
+interface MainDependencies {
+  isQctlSinkAvailable: typeof isQctlSinkAvailable;
+  runQcontrol: typeof runQcontrol;
+}
+
+const defaultMainDependencies: MainDependencies = {
+  isQctlSinkAvailable,
+  runQcontrol,
+};
 
 /**
  * Starts qctl's local event pipeline by binding the collector socket before the
@@ -62,11 +81,48 @@ export async function daemon(): Promise<number> {
   }
 }
 
+/** Detects whether qcontrol run already has an explicit sink before its command separator. */
+function hasExplicitRunSink(args: string[]): boolean {
+  for (const arg of args.slice(1)) {
+    if (arg === "--") {
+      return false;
+    }
+
+    if (arg === "--sink" || arg.startsWith("--sink=")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Defaults `qcontrol run` output into qctl's daemon collector when the collector
+ * is already running and the user did not choose a sink explicitly.
+ */
+export async function resolveQcontrolArgs(
+  args: string[],
+  dependencies: Pick<MainDependencies, "isQctlSinkAvailable"> = defaultMainDependencies,
+): Promise<string[]> {
+  if (args[0] !== "run" || hasExplicitRunSink(args)) {
+    return args;
+  }
+
+  if (!(await dependencies.isQctlSinkAvailable())) {
+    return args;
+  }
+
+  return ["run", "--sink", getQctlSinkUrl(), ...args.slice(1)];
+}
+
 /**
  * Dispatches CLI arguments to qctl lifecycle helpers or forwards unknown
  * commands unchanged to qcontrol, preserving the child process exit code.
  */
-export async function main(args = process.argv.slice(2)): Promise<number> {
+export async function main(
+  args = process.argv.slice(2),
+  dependencies: MainDependencies = defaultMainDependencies,
+): Promise<number> {
   switch (args[0]) {
     case "install":
       return install();
@@ -83,7 +139,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     case "daemon":
       return daemon();
     default:
-      return runQcontrol({ args });
+      return dependencies.runQcontrol({ args: await resolveQcontrolArgs(args, dependencies) });
   }
 }
 
