@@ -7,6 +7,8 @@
     "dev": "bun run src/main.ts",
     "build": "bun build src/main.ts --compile --outfile bin/qctl",
     "build:win": "bun build src/main.ts --compile --outfile bin/qctl.exe",
+    "build:win-installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1",
+    "verify:win-installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-windows-installer.ps1",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
