@@ -1,11 +1,9 @@
 /**
- * Owns qctl's Unix socket event collector, which receives qcontrol sink records
- * from the configured socket path, resolves event dependencies, and dispatches
+ * Owns qctl's local event collector, which receives qcontrol sink records from
+ * a macOS socket or Windows named pipe, resolves dependencies, and dispatches
  * complete event records to forwarders.
  */
-import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname } from "node:path";
 
 import {
   ConsoleForwarder,
@@ -15,6 +13,7 @@ import {
   type QcontrolProcess,
 } from "./forwarder";
 import { getQctlSocketPath } from "./installation";
+import { platformAdapter, type PlatformAdapter } from "./platform";
 
 const DEFAULT_QUEUE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 10_000;
@@ -31,6 +30,7 @@ type RawRecord = Record<string, unknown>;
 
 /** Configures socket ownership and forwarding behavior for a collector instance. */
 export interface CollectorOptions {
+  platform?: PlatformAdapter;
   socketPath?: string;
   socketMode?: number;
   forwarders?: Forwarder[];
@@ -66,32 +66,6 @@ type ForwardResult =
 interface QueuedEvent {
   event: RawRecord;
   expiresAt: number;
-}
-
-/** Narrows filesystem failures to Node errno errors without trusting throws. */
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error;
-}
-
-/**
- * Removes a stale Unix socket while refusing to unlink regular files that may
- * have been created by a user or another qctl component.
- */
-async function removeStaleSocket(socketPath: string): Promise<void> {
-  try {
-    const socketStat = await lstat(socketPath);
-    if (!socketStat.isSocket()) {
-      throw new Error(`refusing to replace non-socket path: ${socketPath}`);
-    }
-  } catch (error) {
-    if (!isNodeError(error) || error.code !== "ENOENT") {
-      throw error;
-    }
-
-    return;
-  }
-
-  await rm(socketPath);
 }
 
 /** Confirms a parsed value is an object payload that can carry qcontrol fields. */
@@ -532,17 +506,19 @@ class EventConnection {
 }
 
 /**
- * Listens on qctl's configured Unix socket sink and forwards qcontrol event
- * records until stopped by the owning process.
+ * Listens on qctl's configured local sink and forwards qcontrol event records
+ * until stopped by the owning process.
  */
 export class Collector {
   private readonly router: EventRouter;
+  private readonly platform: PlatformAdapter;
   private readonly socketMode?: number;
   private readonly socketPath: string;
   private server?: Server;
 
   constructor(options: CollectorOptions = {}) {
-    this.socketPath = options.socketPath ?? getQctlSocketPath();
+    this.platform = options.platform ?? platformAdapter;
+    this.socketPath = options.socketPath ?? getQctlSocketPath(this.platform);
     this.socketMode = options.socketMode;
     this.router = new EventRouter({
       forwarders: options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()],
@@ -553,7 +529,7 @@ export class Collector {
     });
   }
 
-  /** Returns the socket file path that this collector binds when started. */
+  /** Returns the local endpoint path that this collector binds when started. */
   get path(): string {
     return this.socketPath;
   }
@@ -568,14 +544,13 @@ export class Collector {
     return this.server;
   }
 
-  /** Binds the Unix socket sink and begins forwarding records from connections. */
+  /** Binds the local stream sink and begins forwarding records from connections. */
   async start(): Promise<Server> {
     if (this.server?.listening) {
       return this.server;
     }
 
-    await mkdir(dirname(this.socketPath), { recursive: true });
-    await removeStaleSocket(this.socketPath);
+    await this.platform.prepareCollectorEndpoint(this.socketPath);
 
     const server = createServer((socket) => {
       new EventConnection(socket, this.router);
@@ -599,7 +574,7 @@ export class Collector {
     if (this.socketMode !== undefined) {
       // The launchd root daemon owns the socket file, but user qcontrol runs
       // still need to connect to the sink configured in the user's run.toml.
-      await chmod(this.socketPath, this.socketMode);
+      await this.platform.applyCollectorMode(this.socketPath, this.socketMode);
     }
 
     this.router.startSweeping();
@@ -628,6 +603,6 @@ export class Collector {
       });
     });
 
-    await removeStaleSocket(this.socketPath);
+    await this.platform.cleanupCollectorEndpoint(this.socketPath);
   }
 }

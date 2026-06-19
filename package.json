@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "bun run src/main.ts",
     "build": "bun build src/main.ts --compile --outfile bin/qctl",
+    "build:win": "bun build src/main.ts --compile --outfile bin/qctl.exe",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

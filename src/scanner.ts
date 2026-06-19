@@ -1,29 +1,37 @@
 /**
  * Owns the qcontrol scan watcher lifecycle that reports discovered agent
- * installations and process events to qctl's Unix socket sink.
+ * installations and process events to qctl's local event sink.
  */
 import { getQctlSinkUrl } from "./installation";
+import { platformAdapter, type PlatformAdapter } from "./platform";
 import { type QcontrolBundleOptions, spawnQcontrol, spawnQcontrolAsRoot } from "./qcontrol";
 
 /** Configures process spawning details for a scanner instance. */
 export interface ScannerOptions extends QcontrolBundleOptions {
   autotap?: boolean;
   env?: NodeJS.ProcessEnv;
+  platform?: PlatformAdapter;
   stderr?: Bun.SpawnOptions.Readable;
   stdin?: Bun.SpawnOptions.Writable;
   stdout?: Bun.SpawnOptions.Readable;
   stopSignal?: NodeJS.Signals;
+  spawnQcontrol?: typeof spawnQcontrol;
+  spawnQcontrolAsRoot?: typeof spawnQcontrolAsRoot;
 }
 
 /** Detects whether qcontrol scan can tap targets without another sudo hop. */
-function isCurrentProcessPrivileged(): boolean {
+function isCurrentProcessPrivileged(platform: PlatformAdapter): boolean {
+  if (!platform.canUseRootScanner()) {
+    return true;
+  }
+
   const uid = typeof process.geteuid === "function" ? process.geteuid() : process.getuid?.();
   return uid === 0;
 }
 
 /** Builds the scan watcher command once so privilege handling cannot drift from args. */
-function getWatchScanArgs(autotap: boolean): string[] {
-  const args = ["scan", "--processes", "--watch", "--sink", getQctlSinkUrl()];
+function getWatchScanArgs(autotap: boolean, platform: PlatformAdapter = platformAdapter): string[] {
+  const args = ["scan", "--processes", "--watch", "--sink", getQctlSinkUrl(platform)];
   if (autotap) {
     args.push("--tap");
   }
@@ -32,8 +40,8 @@ function getWatchScanArgs(autotap: boolean): string[] {
 }
 
 /** Builds the one-shot scan command used to refresh qcontrol's process view. */
-function getRefreshScanArgs(): string[] {
-  return ["scan", "--processes", "--sink", getQctlSinkUrl()];
+function getRefreshScanArgs(platform: PlatformAdapter = platformAdapter): string[] {
+  return ["scan", "--processes", "--sink", getQctlSinkUrl(platform)];
 }
 
 /**
@@ -59,15 +67,19 @@ export class Scanner {
       return this.process;
     }
 
-    const runAsRoot = this.options.autotap === true && !isCurrentProcessPrivileged();
-    const spawnScanner = runAsRoot ? spawnQcontrolAsRoot : spawnQcontrol;
+    const platform = this.options.platform ?? platformAdapter;
+    const runAsRoot = platform.canUseRootScanner() && this.options.autotap === true && !isCurrentProcessPrivileged(platform);
+    const spawnScanner = runAsRoot
+      ? (this.options.spawnQcontrolAsRoot ?? spawnQcontrolAsRoot)
+      : (this.options.spawnQcontrol ?? spawnQcontrol);
     const child = await spawnScanner({
       cacheDir: this.options.cacheDir,
+      platform,
       env: this.options.env,
       stdin: this.options.stdin ?? (runAsRoot ? "inherit" : "ignore"),
       stdout: this.options.stdout ?? "ignore",
       stderr: this.options.stderr ?? (runAsRoot ? "inherit" : "ignore"),
-      args: getWatchScanArgs(this.options.autotap === true),
+      args: getWatchScanArgs(this.options.autotap === true, platform),
     });
 
     this.process = child;
@@ -84,13 +96,16 @@ export class Scanner {
 
   /** Starts a one-shot process scan against qctl's sink without taking ownership. */
   async refresh(): Promise<Bun.Subprocess> {
-    return spawnQcontrol({
+    const platform = this.options.platform ?? platformAdapter;
+    const spawnRefresh = this.options.spawnQcontrol ?? spawnQcontrol;
+    return spawnRefresh({
       cacheDir: this.options.cacheDir,
+      platform,
       env: this.options.env,
       stdin: this.options.stdin ?? "ignore",
       stdout: this.options.stdout ?? "ignore",
       stderr: this.options.stderr ?? "ignore",
-      args: getRefreshScanArgs(),
+      args: getRefreshScanArgs(platform),
     });
   }
 

@@ -1,6 +1,6 @@
 /**
  * Defines event forwarding targets used by the collector after it receives
- * qcontrol sink records from the local Unix socket, parses them into events,
+ * qcontrol sink records from the local collector endpoint, parses them into events,
  * and resolves installation/process dependencies for downstream consumers.
  */
 

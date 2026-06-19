@@ -2,14 +2,15 @@
  * Manages the embedded qcontrol binary: materializing it into an executable
  * cache location, spawning it, and preserving terminal signal behavior.
  */
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import embeddedQcontrolPath from "../vendor/qcontrol.bin" with { type: "file" };
+import { createPlatformAdapter, platformAdapter, type PlatformAdapter } from "./platform";
 
 /** Controls where the embedded qcontrol executable is materialized. */
 export interface QcontrolBundleOptions {
+  platform?: PlatformAdapter;
   cacheDir?: string;
 }
 
@@ -38,21 +39,19 @@ interface QcontrolBundleMetadata {
   lastModified: number;
 }
 
+/** Adapts legacy helper inputs to the shared platform contract. */
+function platformAdapterFor(platform: NodeJS.Platform | PlatformAdapter): PlatformAdapter {
+  return typeof platform === "string" ? createPlatformAdapter(platform) : platform;
+}
+
 /** Resolves the cache root using explicit wrapper, XDG, and platform defaults. */
-function defaultCacheRoot(): string {
-  if (process.env.QCONTROL_WRAPPER_CACHE_DIR) {
-    return process.env.QCONTROL_WRAPPER_CACHE_DIR;
-  }
+export function defaultCacheRoot(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string {
+  return platformAdapterFor(platform).defaultCacheRoot(process.env);
+}
 
-  if (process.env.XDG_CACHE_HOME) {
-    return join(process.env.XDG_CACHE_HOME, "qcontrol-wrapper-ts");
-  }
-
-  if (process.platform === "darwin") {
-    return join(homedir(), "Library", "Caches", "qcontrol-wrapper-ts");
-  }
-
-  return join(homedir(), ".cache", "qcontrol-wrapper-ts");
+/** Returns the materialized executable name required by the host platform. */
+export function qcontrolExecutableName(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string {
+  return platformAdapterFor(platform).qcontrolExecutableName;
 }
 
 /** Builds cache metadata from Bun's view of the embedded binary asset. */
@@ -102,10 +101,11 @@ async function cachedBinaryMatches(binaryPath: string, metadataPath: string, met
  * into a content-addressed cache when no valid cached copy exists.
  */
 export async function getQcontrolPath(options: QcontrolBundleOptions = {}): Promise<string> {
+  const platform = options.platform ?? platformAdapter;
   const binary = Bun.file(embeddedQcontrolPath);
   const metadata = getBundleMetadata(binary);
-  const cacheDir = join(options.cacheDir ?? defaultCacheRoot(), cacheKey(metadata));
-  const binaryPath = join(cacheDir, "qcontrol");
+  const cacheDir = join(options.cacheDir ?? defaultCacheRoot(platform), cacheKey(metadata));
+  const binaryPath = join(cacheDir, qcontrolExecutableName(platform));
   const metadataPath = join(cacheDir, "qcontrol.meta.json");
 
   if (await cachedBinaryMatches(binaryPath, metadataPath, metadata)) {
@@ -118,7 +118,7 @@ export async function getQcontrolPath(options: QcontrolBundleOptions = {}): Prom
 
   const temporaryPath = join(cacheDir, `qcontrol.${process.pid}.tmp`);
   await Bun.write(temporaryPath, binary);
-  await chmod(temporaryPath, 0o755);
+  await platform.prepareExecutable(temporaryPath);
 
   try {
     await rename(temporaryPath, binaryPath);
