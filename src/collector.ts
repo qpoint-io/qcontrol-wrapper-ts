@@ -111,6 +111,108 @@ function getDependencyPid(event: RawRecord): number | undefined {
   return (run && getNumberField(run, "agent_pid")) ?? (run && getNumberField(run, "run_pid")) ?? (payload && getNumberField(payload, "pid"));
 }
 
+/** Returns the process id qcontrol run uses as the anchor for explicit launches. */
+function getRunProcessPid(run: RawRecord): number | undefined {
+  return getNumberField(run, "agent_pid") ?? getNumberField(run, "run_pid");
+}
+
+/** Keeps only the agent identity fields shared by scan and run attribution. */
+function toScanAgent(agent: RawRecord | undefined): RawRecord | undefined {
+  if (!agent) {
+    return undefined;
+  }
+
+  const id = getStringField(agent, "id");
+  const name = getStringField(agent, "name");
+  const vendor = getStringField(agent, "vendor");
+  const kind = getStringField(agent, "kind");
+  if (!id || !name || !vendor || !kind) {
+    return undefined;
+  }
+
+  return { id, name, vendor, kind };
+}
+
+/** Returns the run-started payload's agent attribution when present. */
+function getRunStartedAgent(payload: RawRecord | undefined): RawRecord | undefined {
+  return payload && isRecord(payload.agent) ? payload.agent : undefined;
+}
+
+/** Builds argv from qcontrol run's launch payload without inventing arguments. */
+function getRunStartedArgv(payload: RawRecord): string[] | undefined {
+  const cmd = getStringField(payload, "cmd");
+  if (!cmd) {
+    return undefined;
+  }
+
+  const args = Array.isArray(payload.args) && payload.args.every((arg) => typeof arg === "string")
+    ? payload.args as string[]
+    : [];
+  return [cmd, ...args];
+}
+
+/** Adds the same stable process entity id used for scanner process roots. */
+function addProcessEntityId(processRecord: RawRecord): void {
+  const startedAtMs = Date.parse(String(processRecord.started_at));
+  const startSecs = Number.isFinite(startedAtMs) ? Math.floor(startedAtMs / 1000) : 0;
+  processRecord.entity_id = `pid:${String(processRecord.pid)}:start:${String(startSecs)}`;
+}
+
+/** Synthesizes an installation root from an explicit qcontrol run launch. */
+function installationFromRunStarted(event: RawRecord): RawRecord | undefined {
+  const run = getRun(event);
+  const payload = getPayload(event);
+  const installationId = run ? getStringField(run, "installation_id") : undefined;
+  const executablePath = payload ? getStringField(payload, "exe") : undefined;
+  const agent = toScanAgent(getRunStartedAgent(payload));
+  if (!installationId || !executablePath || !agent) {
+    return undefined;
+  }
+
+  return {
+    id: installationId,
+    agent,
+    executable_path: executablePath,
+  };
+}
+
+/** Synthesizes a process root from an explicit qcontrol run launch. */
+function processFromRunStarted(event: RawRecord): RawRecord | undefined {
+  const run = getRun(event);
+  const payload = getPayload(event);
+  if (!run || !payload) {
+    return undefined;
+  }
+
+  const pid = getRunProcessPid(run);
+  const executablePath = getStringField(payload, "exe");
+  const startedAt = getStringField(run, "started_at");
+  const agentAttribution = getRunStartedAgent(payload);
+  const agent = toScanAgent(agentAttribution);
+  if (pid === undefined || !executablePath || !startedAt || !agent) {
+    return undefined;
+  }
+
+  const runPid = getNumberField(run, "run_pid");
+  const installationId = getStringField(run, "installation_id");
+  const cwd = getStringField(payload, "cwd");
+  const matches = agentAttribution && Array.isArray(agentAttribution.matches) ? agentAttribution.matches : undefined;
+  const processRecord: RawRecord = {
+    pid,
+    ...(installationId ? { installation_id: installationId } : {}),
+    ...(runPid !== undefined && runPid !== pid ? { ppid: runPid } : {}),
+    exe: executablePath,
+    ...(getRunStartedArgv(payload) ? { argv: getRunStartedArgv(payload) } : {}),
+    ...(cwd ? { cwd } : {}),
+    agent,
+    ...(matches ? { matches } : {}),
+    started_at: startedAt,
+  };
+
+  addProcessEntityId(processRecord);
+  return processRecord;
+}
+
 /** Resolved configuration the collector hands to its event router. */
 interface EventRouterOptions {
   forwarders: Forwarder[];
@@ -227,6 +329,8 @@ class EventRouter {
         return this.forwardInstallationDiscovered(event);
       case "process.started":
         return this.forwardProcessStarted(event);
+      case "run.started":
+        return this.forwardRunStarted(event);
       default:
         return this.forwardDependentEvent(event);
     }
@@ -259,10 +363,7 @@ class EventRouter {
       return { status: "dropped" };
     }
 
-    // Add entity_id as a globally unique identifier for the process.
-    const startedAtMs = Date.parse(String(processRecord.started_at));
-    const startSecs = Number.isFinite(startedAtMs) ? Math.floor(startedAtMs / 1000) : 0;
-    processRecord.entity_id = `pid:${String(pid)}:start:${String(startSecs)}`;
+    addProcessEntityId(processRecord);
 
     const installation = this.installations.get(installationId);
     if (!installation) {
@@ -277,11 +378,58 @@ class EventRouter {
     return { status: "forwarded" };
   }
 
+  /** Treats explicit qcontrol run launches as roots even before scan catches up. */
+  private forwardRunStarted(event: RawRecord): ForwardResult {
+    const installation = installationFromRunStarted(event);
+    const processRecord = processFromRunStarted(event);
+
+    if (installation) {
+      const installationId = getStringField(installation, "id");
+      if (installationId) {
+        this.installations.set(installationId, installation);
+      }
+    }
+
+    if (processRecord) {
+      const pid = getNumberField(processRecord, "pid");
+      if (pid !== undefined) {
+        this.stoppedProcessDeadlines.delete(pid);
+        this.processes.set(pid, processRecord);
+      }
+    }
+
+    this.forward(event, installation, processRecord);
+
+    const installationId = installation ? getStringField(installation, "id") : undefined;
+    const pid = processRecord ? getNumberField(processRecord, "pid") : undefined;
+    if (installationId) {
+      this.flushPending(`inst:${installationId}`);
+    }
+    if (pid !== undefined) {
+      this.flushPending(`pid:${pid}`);
+    }
+
+    return { status: "forwarded" };
+  }
+
   /** Forwards non-root events only after both installation and process exist. */
   private forwardDependentEvent(event: RawRecord): ForwardResult {
+    const isExplicitRunEvent = getRun(event) !== undefined;
     const installationId = getDependencyInstallationId(event);
     const pid = getDependencyPid(event);
-    if (!installationId || pid === undefined) {
+    if (!installationId && !isExplicitRunEvent) {
+      console.error(`dropping qcontrol event without process dependencies: ${String(event.type)}`);
+      this.counters.dropped += 1;
+      return { status: "dropped" };
+    }
+
+    if (pid === undefined) {
+      if (isExplicitRunEvent) {
+        const installation = installationId ? this.installations.get(installationId) : undefined;
+        this.forward(event, installation);
+        return { status: "forwarded" };
+      }
+
       console.error(`dropping qcontrol event without process dependencies: ${String(event.type)}`);
       this.counters.dropped += 1;
       return { status: "dropped" };
@@ -289,12 +437,18 @@ class EventRouter {
 
     const processRecord = this.processes.get(pid);
     if (!processRecord) {
+      if (isExplicitRunEvent) {
+        const installation = installationId ? this.installations.get(installationId) : undefined;
+        this.forward(event, installation);
+        return { status: "forwarded" };
+      }
+
       return { status: "waiting", on: `pid:${pid}` };
     }
 
     const processInstallationId = getStringField(processRecord, "installation_id");
-    const installation = this.installations.get(installationId) ?? (processInstallationId ? this.installations.get(processInstallationId) : undefined);
-    if (!installation) {
+    const installation = (installationId ? this.installations.get(installationId) : undefined) ?? (processInstallationId ? this.installations.get(processInstallationId) : undefined);
+    if (!installation && !isExplicitRunEvent) {
       return { status: "waiting", on: `inst:${installationId}` };
     }
 
