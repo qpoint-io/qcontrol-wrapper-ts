@@ -26,6 +26,39 @@ function Invoke-CheckedCommand {
   }
 }
 
+function Save-QcontrolBinary {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string] $OutputPath,
+    [Parameter(Mandatory = $true)]
+    [string] $Architecture
+  )
+
+  $version = if ($env:VERSION) { $env:VERSION } else { "latest" }
+  $url = "https://downloads.qpoint.io/qcontrol/qcontrol-$version-windows-$Architecture.tgz"
+  $temporaryDirectory = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString()))
+
+  try {
+    $archivePath = Join-Path $temporaryDirectory "qcontrol.tgz"
+    Write-Host "Downloading qcontrol $version for windows/$Architecture"
+    Invoke-CheckedCommand "curl.exe" @("-fsSL", $url, "-o", $archivePath)
+    Invoke-CheckedCommand "tar.exe" @("-xzf", $archivePath, "-C", $temporaryDirectory)
+
+    $downloadedBinary = Join-Path $temporaryDirectory "qcontrol.exe"
+    if (-not (Test-Path -LiteralPath $downloadedBinary -PathType Leaf)) {
+      throw "Downloaded qcontrol archive did not contain qcontrol.exe"
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path $OutputPath) | Out-Null
+    Move-Item -LiteralPath $downloadedBinary -Destination $OutputPath -Force
+
+    $qcontrolVersion = & $OutputPath --version
+    Write-Host "Installed $qcontrolVersion at $OutputPath"
+  } finally {
+    Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Get-WindowsInstallerVersion {
   $packageJsonPath = Join-Path $repoRoot "package.json"
   $packageJson = Get-Content -Raw $packageJsonPath | ConvertFrom-Json
@@ -101,10 +134,7 @@ Push-Location $repoRoot
 try {
   $qcontrolPath = Join-Path $repoRoot $QcontrolBinary
   if (-not (Test-Path -LiteralPath $qcontrolPath -PathType Leaf)) {
-    throw @"
-Missing $QcontrolBinary.
-Windows qcontrol builds are not published yet. Copy the built qcontrol binary to bin\qcontrol.bin.
-"@
+    Save-QcontrolBinary -OutputPath $qcontrolPath -Architecture $Architecture
   }
 
   $productVersion = Get-WindowsInstallerVersion

@@ -23,22 +23,10 @@ build: qcontrol
 qcontrol: $(QCONTROL_BIN)
 
 $(QCONTROL_BIN):
-ifneq ($(WINDOWS_UNAME),)
-	@printf '%s\n' 'Windows qcontrol builds are not published yet.'
-	@printf '%s\n' 'Copy the built qcontrol binary to bin\qcontrol.bin, then rerun make build.'
-	@exit 1
-else
 	./scripts/download-qcontrol.sh $(QCONTROL_BIN)
-endif
 
 update-qcontrol:
-ifneq ($(WINDOWS_UNAME),)
-	@printf '%s\n' 'Windows qcontrol builds are not published yet.'
-	@printf '%s\n' 'Copy the built qcontrol binary to bin\qcontrol.bin manually.'
-	@exit 1
-else
 	./scripts/download-qcontrol.sh $(QCONTROL_BIN)
-endif
 
 pkg:
 	./scripts/build-pkg.sh
