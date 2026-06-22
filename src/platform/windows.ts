@@ -46,6 +46,22 @@ export function createWindowsPlatformAdapter(): PlatformAdapter {
       return false;
     },
 
+    configPath(env = process.env) {
+      if (env.QCTL_CONFIG_DIR) {
+        return env.QCTL_CONFIG_DIR;
+      }
+
+      if (env.APPDATA) {
+        return join(env.APPDATA, "qcontrol");
+      }
+
+      if (env.LOCALAPPDATA) {
+        return join(env.LOCALAPPDATA, "qcontrol");
+      }
+
+      return join(homedir(), "AppData", "Roaming", "qcontrol");
+    },
+
     defaultCacheRoot(env = process.env) {
       if (env.QCONTROL_WRAPPER_CACHE_DIR) {
         return env.QCONTROL_WRAPPER_CACHE_DIR;

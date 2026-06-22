@@ -10,6 +10,7 @@ export interface PlatformAdapter {
 
   applyCollectorMode(endpointPath: string, mode?: number): Promise<void>;
   canUseRootScanner(): boolean;
+  configPath(env?: NodeJS.ProcessEnv): string;
   defaultCacheRoot(env?: NodeJS.ProcessEnv): string;
   defaultCollectorEndpoint(env?: NodeJS.ProcessEnv): string;
   cleanupCollectorEndpoint(endpointPath: string): Promise<void>;

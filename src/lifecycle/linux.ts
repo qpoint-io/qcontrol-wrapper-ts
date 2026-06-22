@@ -30,5 +30,6 @@ export function createLinuxLifecycleActions(dependencies: InstallationDependenci
     start: () => unsupportedLinuxLifecycle("start"),
     stop: () => unsupportedLinuxLifecycle("stop"),
     uninstall: () => unsupportedLinuxLifecycle("uninstall"),
+    uninstallSystem: () => unsupportedLinuxLifecycle("uninstall-system"),
   };
 }

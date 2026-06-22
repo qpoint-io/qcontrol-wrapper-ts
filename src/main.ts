@@ -13,6 +13,7 @@ import {
   start,
   stop,
   uninstall,
+  uninstallSystem,
 } from "./installation";
 import { platformAdapter } from "./platform";
 import { runQcontrol } from "./qcontrol";
@@ -132,6 +133,8 @@ export async function main(
       return initUser();
     case "uninstall":
       return uninstall();
+    case "uninstall-system":
+      return uninstallSystem();
     case "start":
       return start();
     case "stop":
