@@ -6,7 +6,7 @@ The default implementation already handles the parts that should not need to be 
 
 - bundles and materializes the upstream `qcontrol` binary
 - proxies unknown CLI commands through to `qcontrol`
-- installs a macOS LaunchDaemon for the long-running scanner
+- installs a macOS LaunchDaemon or Windows Service for the long-running scanner
 - configures qcontrol's run-event local sink
 - collects newline-delimited JSON records from that socket or named pipe
 - resolves installation and process context before delivery
@@ -17,7 +17,10 @@ The default implementation already handles the parts that should not need to be 
 `qctl` is the wrapper binary built from `src/main.ts`. Wrapper-owned commands are handled locally:
 
 - `qctl install`
+- `qctl install-system`
+- `qctl init-user`
 - `qctl uninstall`
+- `qctl uninstall-system`
 - `qctl start`
 - `qctl stop`
 - `qctl daemon`
@@ -189,9 +192,9 @@ bun run build:win-installer
 bun run verify:win-installer
 ```
 
-The Windows installer is written to `dist\qctl-<version>-windows-x64-setup.exe`. It installs `qctl.exe` to `C:\Program Files\qctl\qctl.exe` and adds `C:\Program Files\qctl` to the system `PATH`; open a new terminal before relying on the updated `PATH`. The installer requires administrator rights and Windows 10 or newer.
+The Windows installer is written to `dist\qctl-<version>-windows-x64-setup.exe`. It installs `qctl.exe` and `qctl-service.exe` to `C:\Program Files\qctl`, adds `C:\Program Files\qctl` to the system `PATH`, and runs `qctl install-system`; open a new terminal before relying on the updated `PATH`. The installer requires administrator rights and Windows 10 or newer.
 
-The Windows installer does not download `qcontrol.exe`, install it as a separate file, register a Windows Service, or run `qctl install-system`. Windows upstream qcontrol builds are not published yet, so `bin\qcontrol.bin` remains a manual local prerequisite and is embedded into the compiled wrapper by Bun.
+The Windows installer does not download `qcontrol.exe` or install it as a separate file. Windows upstream qcontrol builds are not published yet, so `bin\qcontrol.bin` remains a manual local prerequisite and is embedded into the compiled wrapper by Bun. System setup runs `qcontrol init --system`, registers a manual-start `qctl` Windows Service running as `LocalSystem`, and keeps service logs/cache under `%ProgramData%\qctl`.
 
 Install and uninstall the Windows installer locally:
 
@@ -202,9 +205,7 @@ qctl --version
 & "$env:ProgramFiles\qctl\unins000.exe" /LOG=dist\uninstall.log
 ```
 
-Run `qctl init-user` as each user who should send qcontrol events to qctl.
-
-On Windows, service lifecycle commands are intentionally unsupported in this MVP; run `qctl daemon` in the foreground until Windows Service support lands in a later PR.
+Run `qctl init-user` as each user who should send qcontrol events to qctl. The Windows service exposes the shared local sink as `pipe://qctl-collector`, backed by `\\.\pipe\qctl-collector`; the service host grants local users read/write access to that pipe after the daemon binds it.
 
 Build the macOS installer package:
 
@@ -259,7 +260,7 @@ These instructions assume the custom forwarder has already been implemented and 
    ./bin/qctl start
    ```
 
-   This bootstraps the LaunchDaemon into the system launchd domain and kickstarts it immediately.
+   On macOS, this bootstraps the LaunchDaemon into the system launchd domain and kickstarts it immediately. On Windows, this starts the `qctl` Windows Service through SCM.
 
 4. Check daemon logs if needed:
 
@@ -267,6 +268,8 @@ These instructions assume the custom forwarder has already been implemented and 
    tail -f /Library/Logs/qctl/stdout.log
    tail -f /Library/Logs/qctl/stderr.log
    ```
+
+   On Windows, service logs are written to `%ProgramData%\qctl\logs\stdout.log` and `%ProgramData%\qctl\logs\stderr.log`.
 
 5. Stop the daemon:
 
@@ -280,9 +283,7 @@ These instructions assume the custom forwarder has already been implemented and 
    ./bin/qctl uninstall
    ```
 
-The daemon socket defaults to `/var/run/qctl/collector.sock`. qcontrol run configuration defaults to `$XDG_CONFIG_HOME/qcontrol/run.toml` or `~/.config/qcontrol/run.toml`.
-
-On Windows, the MVP runtime uses the named-pipe sink `pipe://qctl-collector`, backed by `\\.\pipe\qctl-collector`. Proxy/pass-through commands and foreground `qctl daemon` are supported. Windows service lifecycle commands are intentionally not implemented yet: `install`, `install-system`, `start`, `stop`, and `uninstall` print an unsupported message and return a non-zero exit code.
+The daemon socket defaults to `/var/run/qctl/collector.sock` on macOS and `pipe://qctl-collector` on Windows. qcontrol run configuration defaults to `$XDG_CONFIG_HOME/qcontrol/run.toml` or `~/.config/qcontrol/run.toml`.
 
 ## Configuration overrides
 
@@ -291,6 +292,7 @@ The wrapper supports these environment variables for integration and deployment 
 - `QCTL_EXECUTABLE`: compiled qctl binary path to write into the LaunchDaemon plist during install.
 - `QCTL_CONFIG_DIR`: qcontrol config directory used by install and the daemon.
 - `QCTL_SOCKET_PATH`: local collector endpoint path used by the collector and qcontrol sink config. On Windows, a short pipe name such as `qctl-collector` is normalized to `\\.\pipe\qctl-collector`.
+- `QCTL_SERVICE_HOST`: Windows service host path to register during `qctl install-system`.
 - `QCONTROL_WRAPPER_CACHE_DIR`: cache root where the embedded qcontrol binary is materialized.
 - `VERSION`: qcontrol version used by `scripts/download-qcontrol.sh`; defaults to `latest`.
 

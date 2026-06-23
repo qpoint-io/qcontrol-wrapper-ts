@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { connect } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { runQcontrol, runQcontrolAsRoot } from "./qcontrol";
@@ -33,22 +33,9 @@ const LAUNCHD_LOG_DIR = "/Library/Logs/qctl";
 const RUNTIME_SOCKET_DIR = "/var/run/qctl";
 const RUNTIME_SOCKET_NAME = "collector.sock";
 
-/** Resolves the qcontrol configuration directory using qcontrol's XDG layout. */
-function defaultQcontrolConfigDir(): string {
-  if (process.env[QCTL_CONFIG_DIR_ENV]) {
-    return process.env[QCTL_CONFIG_DIR_ENV];
-  }
-
-  if (process.env.XDG_CONFIG_HOME) {
-    return join(process.env.XDG_CONFIG_HOME, "qcontrol");
-  }
-
-  return join(homedir(), ".config", "qcontrol");
-}
-
 /** Returns the historic config-local socket path so uninstall can migrate it out. */
 function legacyQctlSocketPath(): string {
-  return join(defaultQcontrolConfigDir(), "qctl.sock");
+  return join(platformAdapter.configPath(), "qctl.sock");
 }
 
 /** Adapts legacy helper inputs to the shared platform contract. */
@@ -98,7 +85,7 @@ interface LaunchDaemonPlistOptions {
 
 /** Builds the root LaunchDaemon plist that runs qctl's daemon command in place. */
 function buildLaunchDaemonPlist(options: LaunchDaemonPlistOptions = {}): string {
-  const configDir = defaultQcontrolConfigDir();
+  const configDir = platformAdapter.configPath();
   const includeUserConfigEnvironment = options.includeUserConfigEnvironment ?? true;
   const values = {
     executable: escapePlistString(getQctlExecutablePath()),
@@ -240,8 +227,8 @@ async function removeLaunchDaemon(): Promise<number> {
 }
 
 /** Returns the qcontrol run configuration file that owns event sink settings. */
-export function getQcontrolRunConfigPath(): string {
-  return join(defaultQcontrolConfigDir(), "run.toml");
+export function getQcontrolRunConfigPath(platform: NodeJS.Platform | PlatformAdapter = platformAdapter): string {
+  return join(platformAdapterFor(platform).configPath(), "run.toml");
 }
 
 /** Returns the local endpoint path where qctl listens for qcontrol events. */
@@ -379,7 +366,7 @@ async function appendQctlSinkConfig(): Promise<void> {
     return;
   }
 
-  await mkdir(defaultQcontrolConfigDir(), { recursive: true });
+  await mkdir(platformAdapter.configPath(), { recursive: true });
 
   // Keep appended TOML separated from user content without excess whitespace.
   const separator =
@@ -465,6 +452,9 @@ export const install = defaultInstallationActions.install;
 
 /** Removes qctl's sink hook, then deinitializes qcontrol host integration. */
 export const uninstall = defaultInstallationActions.uninstall;
+
+/** Removes only root/system service assets without mutating per-user qcontrol state. */
+export const uninstallSystem = defaultInstallationActions.uninstallSystem;
 
 /** Loads the root LaunchDaemon and asks launchd to run the daemon immediately. */
 export const start = defaultInstallationActions.start;

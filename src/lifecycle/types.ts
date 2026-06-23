@@ -24,4 +24,5 @@ export interface InstallationActions {
   start: () => Promise<number>;
   stop: () => Promise<number>;
   uninstall: () => Promise<number>;
+  uninstallSystem: () => Promise<number>;
 }

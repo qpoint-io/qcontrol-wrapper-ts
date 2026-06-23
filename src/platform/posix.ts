@@ -3,6 +3,7 @@
  * leaving platform identity and cache defaults to the concrete adapters.
  */
 import { chmod, lstat, mkdir, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -59,6 +60,18 @@ export function createPosixPlatformAdapter(options: PosixPlatformOptions): Platf
 
     canUseRootScanner() {
       return true;
+    },
+
+    configPath(env = process.env) {
+      if (env.QCTL_CONFIG_DIR) {
+        return env.QCTL_CONFIG_DIR;
+      }
+
+      if (env.XDG_CONFIG_HOME) {
+        return join(env.XDG_CONFIG_HOME, "qcontrol");
+      }
+
+      return join(homedir(), ".config", "qcontrol");
     },
 
     defaultCacheRoot(env = process.env) {

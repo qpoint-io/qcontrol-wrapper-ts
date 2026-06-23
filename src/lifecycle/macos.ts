@@ -48,8 +48,12 @@ export function createMacosLifecycleActions(options: MacosLifecycleOptions): Ins
     return initUser();
   };
 
+  const uninstallSystem = async (): Promise<number> => {
+    return dependencies.removeLaunchDaemon();
+  };
+
   const uninstall = async (): Promise<number> => {
-    const launchDaemonExitCode = await dependencies.removeLaunchDaemon();
+    const launchDaemonExitCode = await uninstallSystem();
     if (launchDaemonExitCode !== 0) {
       return launchDaemonExitCode;
     }
@@ -82,5 +86,5 @@ export function createMacosLifecycleActions(options: MacosLifecycleOptions): Ins
     return dependencies.runAsRoot(["launchctl", "bootout", options.launchDaemonTarget]);
   };
 
-  return { dependencies, install, installSystem, initUser, start, stop, uninstall };
+  return { dependencies, install, installSystem, initUser, start, stop, uninstall, uninstallSystem };
 }
