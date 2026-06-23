@@ -9,6 +9,7 @@ OUTPUT=${1:-bin/qcontrol.bin}
 
 OS=
 ARCH=
+BINARY_NAME=qcontrol
 
 case "$(uname -s)" in
 Linux)
@@ -18,7 +19,8 @@ Darwin)
     OS="macos"
     ;;
 MINGW* | MSYS* | CYGWIN*)
-    OS="win"
+    OS="windows"
+    BINARY_NAME=qcontrol.exe
     ;;
 *)
     printf >&2 'unsupported operating system: %s\n' "$(uname -sr)"
@@ -28,9 +30,17 @@ esac
 
 case "$(uname -m)" in
 x86_64)
-    ARCH="amd64"
+    if [ "$OS" = "windows" ]; then
+        ARCH="x64"
+    else
+        ARCH="amd64"
+    fi
     ;;
 aarch64 | arm64)
+    if [ "$OS" = "windows" ]; then
+        printf >&2 'unsupported Windows architecture: %s\n' "$(uname -m)"
+        exit 1
+    fi
     ARCH="arm64"
     ;;
 *)
@@ -52,7 +62,7 @@ mkdir -p "$(dirname "$OUTPUT")"
 printf 'Downloading qcontrol %s for %s/%s\n' "$VERSION" "$OS" "$ARCH"
 curl -fsSL "$url" >"$tmpdir/qcontrol.tgz"
 tar -xzf "$tmpdir/qcontrol.tgz" -C "$tmpdir"
-chmod +x "$tmpdir/qcontrol"
-mv "$tmpdir/qcontrol" "$OUTPUT"
+chmod +x "$tmpdir/$BINARY_NAME"
+mv "$tmpdir/$BINARY_NAME" "$OUTPUT"
 
 printf 'Installed %s at %s\n' "$("$OUTPUT" --version)" "$OUTPUT"

@@ -155,7 +155,6 @@ Developer prerequisites:
 - Bun for dependency installation, tests, and compiled wrapper builds.
 - Make plus the platform package tools for the targets you build. macOS packaging uses Apple's `pkgbuild` and `pkgutil`.
 - Windows installer packaging uses PowerShell and Inno Setup 6. Install Inno Setup with `winget install --id JRSoftware.InnoSetup --source winget`, then open a new terminal or refresh `PATH`.
-- Windows qcontrol upstream builds are not published yet, so Windows wrapper and installer builds require a manually supplied `bin\qcontrol.bin`.
 
 Inno Setup is a development-only requirement for building the Windows installer. It is not a runtime requirement for machines that install and run `qctl.exe`.
 
@@ -172,8 +171,7 @@ make build
 ```
 
 `make build` ensures `bin/qcontrol.bin` exists, downloading qcontrol when needed, then compiles the wrapper to `bin/qctl`.
-
-On Windows, upstream qcontrol builds are not published yet. Copy the built qcontrol binary manually into `bin\qcontrol.bin`.
+On Windows, the download script fetches the upstream `qcontrol-latest-windows-x64.tgz` artifact and stores its `qcontrol.exe` payload at `bin\qcontrol.bin` for Bun to embed.
 
 Useful development commands:
 
@@ -187,14 +185,13 @@ make clean
 Build the Windows installer:
 
 ```powershell
-# Manually copy the built qcontrol binary to bin\qcontrol.bin first.
 bun run build:win-installer
 bun run verify:win-installer
 ```
 
 The Windows installer is written to `dist\qctl-<version>-windows-x64-setup.exe`. It installs `qctl.exe` and `qctl-service.exe` to `C:\Program Files\qctl`, adds `C:\Program Files\qctl` to the system `PATH`, and runs `qctl install-system`; open a new terminal before relying on the updated `PATH`. The installer requires administrator rights and Windows 10 or newer.
 
-The Windows installer does not download `qcontrol.exe` or install it as a separate file. Windows upstream qcontrol builds are not published yet, so `bin\qcontrol.bin` remains a manual local prerequisite and is embedded into the compiled wrapper by Bun. System setup runs `qcontrol init --system`, registers a manual-start `qctl` Windows Service running as `LocalSystem`, and keeps service logs/cache under `%ProgramData%\qctl`.
+The Windows installer does not download `qcontrol.exe` at install time or install it as a separate file. The build embeds the downloaded `bin\qcontrol.bin` payload into the compiled wrapper with Bun. System setup runs `qcontrol init --system`, registers a manual-start `qctl` Windows Service running as `LocalSystem`, and keeps service logs/cache under `%ProgramData%\qctl`.
 
 Install and uninstall the Windows installer locally:
 
