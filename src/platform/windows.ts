@@ -1,11 +1,11 @@
 /**
- * Implements qctl's Windows platform behavior for cache paths, named-pipe
- * sinks, and non-privileged scanner execution.
+ * Implements qctl's Windows platform behavior for cache paths and named-pipe
+ * sinks.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { PlatformAdapter } from "./types";
+import type { InvokingUser, PlatformAdapter } from "./types";
 
 const WINDOWS_PIPE_NAME = "qctl-collector";
 const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\";
@@ -34,7 +34,13 @@ function pipeName(endpointPath: string): string {
     : endpointPath;
 }
 
-/** Creates the Windows adapter used by CLI, collector, scanner, and bundling. */
+/** Detects LocalSystem / service-account sessions that are not a real invoker. */
+function isMachineAccount(username: string | undefined, home: string): boolean {
+  const normalized = username?.toUpperCase();
+  return normalized === "SYSTEM" || normalized === "LOCALSYSTEM" || /[/\\]systemprofile\b/i.test(home);
+}
+
+/** Creates the Windows adapter used by CLI, collector, monitor, and bundling. */
 export function createWindowsPlatformAdapter(): PlatformAdapter {
   return {
     kind: "windows",
@@ -42,7 +48,7 @@ export function createWindowsPlatformAdapter(): PlatformAdapter {
 
     async applyCollectorMode() {},
 
-    canUseRootScanner() {
+    canElevateMonitor() {
       return false;
     },
 
@@ -52,30 +58,32 @@ export function createWindowsPlatformAdapter(): PlatformAdapter {
       }
 
       if (env.APPDATA) {
-        return join(env.APPDATA, "qcontrol");
+        return join(env.APPDATA, "qctl");
+      }
+
+      const user = this.resolveInvokingUser(env);
+      return join(user?.home ?? homedir(), "AppData", "Roaming", "qctl");
+    },
+
+    dataPath(env = process.env) {
+      if (env.QCTL_DATA_DIR || env.QCTL_STATE_DIR) {
+        return env.QCTL_DATA_DIR ?? env.QCTL_STATE_DIR as string;
       }
 
       if (env.LOCALAPPDATA) {
-        return join(env.LOCALAPPDATA, "qcontrol");
+        return join(env.LOCALAPPDATA, "qctl");
       }
 
-      return join(homedir(), "AppData", "Roaming", "qcontrol");
+      const user = this.resolveInvokingUser(env);
+      return join(user?.home ?? homedir(), "AppData", "Local", "qctl");
     },
 
     defaultCacheRoot(env = process.env) {
-      if (env.QCONTROL_WRAPPER_CACHE_DIR) {
-        return env.QCONTROL_WRAPPER_CACHE_DIR;
+      if (env.QCTL_CACHE_DIR || env.QCONTROL_WRAPPER_CACHE_DIR) {
+        return env.QCTL_CACHE_DIR ?? env.QCONTROL_WRAPPER_CACHE_DIR as string;
       }
 
-      if (env.LOCALAPPDATA) {
-        return join(env.LOCALAPPDATA, "qcontrol-wrapper-ts");
-      }
-
-      if (env.XDG_CACHE_HOME) {
-        return join(env.XDG_CACHE_HOME, "qcontrol-wrapper-ts");
-      }
-
-      return join(homedir(), ".cache", "qcontrol-wrapper-ts");
+      return join(this.dataPath(env), "cache");
     },
 
     defaultCollectorEndpoint(env = process.env) {
@@ -88,8 +96,14 @@ export function createWindowsPlatformAdapter(): PlatformAdapter {
 
     async prepareExecutable() {},
 
-    qctlSinkUrls(currentEndpoint) {
-      return [this.sinkUrl(currentEndpoint)];
+    resolveInvokingUser(env = process.env): InvokingUser | undefined {
+      const username = env.USERNAME || env.USER;
+      const home = env.USERPROFILE || env.HOME || homedir();
+      if (!username || isMachineAccount(username, home)) {
+        return undefined;
+      }
+
+      return { username, home };
     },
 
     shouldOpenDaemonEndpoint() {
