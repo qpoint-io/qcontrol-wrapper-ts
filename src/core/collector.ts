@@ -1,19 +1,18 @@
 /**
- * Owns qctl's local event collector, which receives qcontrol sink records from
- * a macOS socket or Windows named pipe, resolves dependencies, and dispatches
- * complete event records to forwarders.
+ * Owns qctl's local event collector, which receives qcontrol monitor records
+ * from a macOS/Linux socket or Windows named pipe, resolves entity and
+ * installation context, and dispatches complete records to forwarders.
  */
 import { createServer, type Server, type Socket } from "node:net";
 
 import {
-  ConsoleForwarder,
   type Forwarder,
   type QcontrolEvent,
   type QcontrolInstallation,
   type QcontrolProcess,
 } from "./forwarder";
-import { getQctlSocketPath } from "./installation";
-import { platformAdapter, type PlatformAdapter } from "./platform";
+import { getQctlSocketPath } from "./paths";
+import { platformAdapter, type PlatformAdapter } from "../platform";
 
 const DEFAULT_QUEUE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_QUEUED_EVENTS = 10_000;
@@ -51,7 +50,7 @@ export interface CollectorStats {
 }
 
 /** Names the index entry an unresolved event is waiting for. */
-type DependencyKey = `inst:${string}` | `pid:${number}`;
+type DependencyKey = `inst:${string}` | `entity:${string}`;
 
 /**
  * Reports what routing did with one event: delivered, discarded as malformed,
@@ -62,7 +61,7 @@ type ForwardResult =
   | { status: "dropped" }
   | { status: "waiting"; on: DependencyKey };
 
-/** Tracks an unresolved event until its installation and process can be found. */
+/** Tracks an unresolved event until its process or installation can be found. */
 interface QueuedEvent {
   event: RawRecord;
   expiresAt: number;
@@ -78,37 +77,35 @@ function getPayload(event: RawRecord): RawRecord | undefined {
   return isRecord(event.payload) ? event.payload : undefined;
 }
 
-/** Returns the qcontrol run block that carries dependencies for runtime events. */
-function getRun(event: RawRecord): RawRecord | undefined {
-  return isRecord(event.run) ? event.run : undefined;
-}
-
-/** Reads a required string identifier from a payload without coercing bad data. */
+/** Reads a required string identifier from a record without coercing bad data. */
 function getStringField(record: Record<string, unknown>, field: string): string | undefined {
   const value = record[field];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-/** Reads a required numeric identifier from a payload without coercing bad data. */
-function getNumberField(record: Record<string, unknown>, field: string): number | undefined {
-  const value = record[field];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+/** Copies the monitor-authored process identity off the event envelope. */
+function getEntityId(event: RawRecord): string | undefined {
+  return getStringField(event, "entity_id");
 }
 
-/** Finds the installation dependency using the schema appropriate to the event. */
-function getDependencyInstallationId(event: RawRecord): string | undefined {
-  const run = getRun(event);
-  const payload = getPayload(event);
+/** Builds the process record forwarders see, using the envelope entity_id as-is. */
+function processFromStarted(event: RawRecord, payload: RawRecord): RawRecord | undefined {
+  const entityId = getEntityId(event);
+  if (!entityId) {
+    return undefined;
+  }
 
-  return (run && getStringField(run, "installation_id")) ?? (payload && getStringField(payload, "installation_id"));
+  return { ...payload, entity_id: entityId };
 }
 
-/** Finds the process dependency using run metadata before legacy payload fields. */
-function getDependencyPid(event: RawRecord): number | undefined {
-  const run = getRun(event);
-  const payload = getPayload(event);
+/** Builds process context from one snapshot entry that already carries entity_id. */
+function processFromSnapshotEntry(entry: RawRecord): RawRecord | undefined {
+  const entityId = getStringField(entry, "entity_id");
+  if (!entityId) {
+    return undefined;
+  }
 
-  return (run && getNumberField(run, "agent_pid")) ?? (run && getNumberField(run, "run_pid")) ?? (payload && getNumberField(payload, "pid"));
+  return { ...entry, entity_id: entityId };
 }
 
 /** Resolved configuration the collector hands to its event router. */
@@ -121,18 +118,17 @@ interface EventRouterOptions {
 }
 
 /**
- * Resolves qcontrol event dependencies by indexing root installation and process
- * events, then holding dependent records until both indexes can satisfy them.
- * Unresolved events are parked under the specific dependency they are missing,
- * so a discovery only replays the events it can actually unlock.
+ * Resolves qcontrol event context by indexing installations and process
+ * lifetimes, then holding entity-scoped records until their process exists.
+ * Unresolved events are parked under the specific dependency they are missing.
  */
 class EventRouter {
   private readonly forwarders: Forwarder[];
   private readonly installations = new Map<string, RawRecord>();
-  private readonly processes = new Map<number, RawRecord>();
+  private readonly processes = new Map<string, RawRecord>();
   private readonly pending = new Map<DependencyKey, QueuedEvent[]>();
   private pendingCount = 0;
-  private readonly stoppedProcessDeadlines = new Map<number, number>();
+  private readonly stoppedProcessDeadlines = new Map<string, number>();
   private readonly queueTtlMs: number;
   private readonly maxQueuedEvents: number;
   private readonly maxQueuedEventsPerKey: number;
@@ -207,10 +203,10 @@ class EventRouter {
       }
     }
 
-    for (const [pid, deadline] of this.stoppedProcessDeadlines) {
+    for (const [entityId, deadline] of this.stoppedProcessDeadlines) {
       if (deadline <= now) {
-        this.stoppedProcessDeadlines.delete(pid);
-        this.processes.delete(pid);
+        this.stoppedProcessDeadlines.delete(entityId);
+        this.processes.delete(entityId);
       }
     }
 
@@ -225,87 +221,195 @@ class EventRouter {
     switch (event.type) {
       case "installation.discovered":
         return this.forwardInstallationDiscovered(event);
+      case "installation.snapshot":
+        return this.forwardInstallationSnapshot(event);
       case "process.started":
         return this.forwardProcessStarted(event);
+      case "process.snapshot":
+        return this.forwardProcessSnapshot(event);
+      case "process.stopped":
+        return this.forwardProcessStopped(event);
       default:
-        return this.forwardDependentEvent(event);
+        return this.forwardDefault(event);
     }
   }
 
   /** Stores a discovered installation and forwards the event with itself attached. */
   private forwardInstallationDiscovered(event: RawRecord): ForwardResult {
     const installation = getPayload(event);
-    const installationId = installation ? getStringField(installation, "id") : undefined;
-    if (!installation || !installationId) {
-      console.error("dropping installation.discovered event without payload.id");
+    if (!installation) {
+      console.error("dropping installation.discovered event without payload");
       this.counters.dropped += 1;
       return { status: "dropped" };
     }
 
-    this.installations.set(installationId, installation);
+    const installationId = getStringField(installation, "id");
+    if (installationId) {
+      this.installations.set(installationId, installation);
+    }
+
     this.forward(event, installation);
-    this.flushPending(`inst:${installationId}`);
+    if (installationId) {
+      this.flushPending(`inst:${installationId}`);
+    }
     return { status: "forwarded" };
   }
 
-  /** Stores a started process after its installation is available. */
+  /** Replaces the installation index with the monitor's authoritative set. */
+  private forwardInstallationSnapshot(event: RawRecord): ForwardResult {
+    const payload = getPayload(event);
+    const records = payload && Array.isArray(payload.installations) ? payload.installations : undefined;
+    if (!records) {
+      console.error("dropping installation.snapshot event without payload.installations");
+      this.counters.dropped += 1;
+      return { status: "dropped" };
+    }
+
+    this.installations.clear();
+    const flushedIds: string[] = [];
+    for (const record of records) {
+      if (!isRecord(record)) {
+        continue;
+      }
+
+      const installationId = getStringField(record, "id");
+      if (!installationId) {
+        continue;
+      }
+
+      this.installations.set(installationId, record);
+      flushedIds.push(installationId);
+    }
+
+    this.forward(event);
+    for (const installationId of flushedIds) {
+      this.flushPending(`inst:${installationId}`);
+    }
+    return { status: "forwarded" };
+  }
+
+  /** Stores a started process after any declared installation is available. */
   private forwardProcessStarted(event: RawRecord): ForwardResult {
-    const processRecord = getPayload(event);
-    const installationId = processRecord ? getStringField(processRecord, "installation_id") : undefined;
-    const pid = processRecord ? getNumberField(processRecord, "pid") : undefined;
-    if (!processRecord || !installationId || pid === undefined) {
-      console.error("dropping process.started event without payload.installation_id or payload.pid");
+    const payload = getPayload(event);
+    const processRecord = payload ? processFromStarted(event, payload) : undefined;
+    if (!processRecord) {
+      console.error("dropping process.started event without entity_id");
       this.counters.dropped += 1;
       return { status: "dropped" };
     }
 
-    // Add entity_id as a globally unique identifier for the process.
-    const startedAtMs = Date.parse(String(processRecord.started_at));
-    const startSecs = Number.isFinite(startedAtMs) ? Math.floor(startedAtMs / 1000) : 0;
-    processRecord.entity_id = `pid:${String(pid)}:start:${String(startSecs)}`;
-
-    const installation = this.installations.get(installationId);
-    if (!installation) {
+    const installationId = getStringField(processRecord, "installation_id");
+    if (installationId && !this.installations.has(installationId)) {
       return { status: "waiting", on: `inst:${installationId}` };
     }
 
-    // A restarted or pid-recycled process supersedes any scheduled eviction.
-    this.stoppedProcessDeadlines.delete(pid);
-    this.processes.set(pid, processRecord);
-    this.forward(event, installation, processRecord);
-    this.flushPending(`pid:${pid}`);
+    return this.indexProcess(event, processRecord, installationId);
+  }
+
+  /** Replaces the process index with the monitor's authoritative running set. */
+  private forwardProcessSnapshot(event: RawRecord): ForwardResult {
+    const payload = getPayload(event);
+    const records = payload && Array.isArray(payload.processes) ? payload.processes : undefined;
+    if (!records) {
+      console.error("dropping process.snapshot event without payload.processes");
+      this.counters.dropped += 1;
+      return { status: "dropped" };
+    }
+
+    this.processes.clear();
+    this.stoppedProcessDeadlines.clear();
+
+    const flushedIds: string[] = [];
+    for (const record of records) {
+      if (!isRecord(record)) {
+        continue;
+      }
+
+      const processRecord = processFromSnapshotEntry(record);
+      if (!processRecord) {
+        continue;
+      }
+
+      const entityId = getStringField(processRecord, "entity_id");
+      if (!entityId) {
+        continue;
+      }
+
+      this.processes.set(entityId, processRecord);
+      flushedIds.push(entityId);
+    }
+
+    this.forward(event);
+    for (const entityId of flushedIds) {
+      this.flushPending(`entity:${entityId}`);
+    }
     return { status: "forwarded" };
   }
 
-  /** Forwards non-root events only after both installation and process exist. */
-  private forwardDependentEvent(event: RawRecord): ForwardResult {
-    const installationId = getDependencyInstallationId(event);
-    const pid = getDependencyPid(event);
-    if (!installationId || pid === undefined) {
-      console.error(`dropping qcontrol event without process dependencies: ${String(event.type)}`);
+  /** Forwards a stop after the matching process lifetime is known, then evicts. */
+  private forwardProcessStopped(event: RawRecord): ForwardResult {
+    const entityId = getEntityId(event);
+    if (!entityId) {
+      console.error("dropping process.stopped event without entity_id");
       this.counters.dropped += 1;
       return { status: "dropped" };
     }
 
-    const processRecord = this.processes.get(pid);
+    const processRecord = this.processes.get(entityId);
     if (!processRecord) {
-      return { status: "waiting", on: `pid:${pid}` };
+      return { status: "waiting", on: `entity:${entityId}` };
     }
 
-    const processInstallationId = getStringField(processRecord, "installation_id");
-    const installation = this.installations.get(installationId) ?? (processInstallationId ? this.installations.get(processInstallationId) : undefined);
-    if (!installation) {
-      return { status: "waiting", on: `inst:${installationId}` };
-    }
-
+    const installation = this.installationForProcess(processRecord);
     this.forward(event, installation, processRecord);
-    if (event.type === "process.stopped") {
-      // Keep the process resolvable for late in-flight events, then let the
-      // sweep unindex it so the process map cannot grow without bound.
-      this.stoppedProcessDeadlines.set(pid, Date.now() + this.processEvictionGraceMs);
+    this.stoppedProcessDeadlines.set(entityId, Date.now() + this.processEvictionGraceMs);
+    return { status: "forwarded" };
+  }
+
+  /**
+   * Forwards remaining records: entity-scoped events wait for their process,
+   * host records deliver immediately with whatever installation context exists.
+   */
+  private forwardDefault(event: RawRecord): ForwardResult {
+    const entityId = getEntityId(event);
+    if (!entityId) {
+      const payload = getPayload(event);
+      const installationId = payload ? getStringField(payload, "id") : undefined;
+      const installation = installationId ? this.installations.get(installationId) : undefined;
+      this.forward(event, installation);
+      return { status: "forwarded" };
     }
 
+    const processRecord = this.processes.get(entityId);
+    if (!processRecord) {
+      return { status: "waiting", on: `entity:${entityId}` };
+    }
+
+    this.forward(event, this.installationForProcess(processRecord), processRecord);
     return { status: "forwarded" };
+  }
+
+  /** Indexes one live process and unlocks events waiting on its entity_id. */
+  private indexProcess(event: RawRecord, processRecord: RawRecord, installationId?: string): ForwardResult {
+    const entityId = getStringField(processRecord, "entity_id");
+    if (!entityId) {
+      console.error("dropping process record without entity_id");
+      this.counters.dropped += 1;
+      return { status: "dropped" };
+    }
+
+    this.stoppedProcessDeadlines.delete(entityId);
+    this.processes.set(entityId, processRecord);
+    const installation = installationId ? this.installations.get(installationId) : undefined;
+    this.forward(event, installation, processRecord);
+    this.flushPending(`entity:${entityId}`);
+    return { status: "forwarded" };
+  }
+
+  /** Resolves installation context from a process record's optional join key. */
+  private installationForProcess(processRecord: RawRecord): RawRecord | undefined {
+    const installationId = getStringField(processRecord, "installation_id");
+    return installationId ? this.installations.get(installationId) : undefined;
   }
 
   /** Delivers a resolved event to each configured destination in collector order. */
@@ -384,10 +488,9 @@ class EventRouter {
 
   /**
    * Replays every event parked under a freshly resolved dependency. A replayed
-   * process.started that registers its pid flushes that pid's bucket in turn,
-   * so a single installation discovery still cascades to the run events behind
-   * it. Events still missing another dependency are re-parked under it with
-   * their original deadline.
+   * process.started that registers its entity_id flushes that entity's bucket
+   * in turn. Events still missing another dependency are re-parked under it
+   * with their original deadline.
    */
   private flushPending(key: DependencyKey): void {
     const bucket = this.pending.get(key);
@@ -521,7 +624,7 @@ export class Collector {
     this.socketPath = options.socketPath ?? getQctlSocketPath(this.platform);
     this.socketMode = options.socketMode;
     this.router = new EventRouter({
-      forwarders: options.forwarders ? [...options.forwarders] : [new ConsoleForwarder()],
+      forwarders: options.forwarders ? [...options.forwarders] : [],
       queueTtlMs: options.queueTtlMs ?? DEFAULT_QUEUE_TTL_MS,
       maxQueuedEvents: options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS,
       maxQueuedEventsPerKey: options.maxQueuedEventsPerKey ?? DEFAULT_MAX_QUEUED_EVENTS_PER_KEY,
@@ -572,8 +675,8 @@ export class Collector {
     });
 
     if (this.socketMode !== undefined) {
-      // The launchd root daemon owns the socket file, but user qcontrol runs
-      // still need to connect to the sink configured in the user's run.toml.
+      // A privileged daemon owns the socket file, but the elevated monitor still
+      // needs to connect to the sink configured in the user's config.toml.
       await this.platform.applyCollectorMode(this.socketPath, this.socketMode);
     }
 

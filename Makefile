@@ -14,7 +14,7 @@ BINARY := qctl$(EXE_SUFFIX)
 
 .DEFAULT_GOAL := build
 
-.PHONY: dev build qcontrol update-qcontrol pkg win-installer clean
+.PHONY: dev build qcontrol update-qcontrol test pkg clean
 
 build: qcontrol
 	mkdir -p $(BIN_DIR)
@@ -27,12 +27,19 @@ $(QCONTROL_BIN):
 
 update-qcontrol:
 	./scripts/download-qcontrol.sh $(QCONTROL_BIN)
+	./scripts/sync-qcontrol-types.sh
 
-pkg:
-	./scripts/build-pkg.sh
+test:
+	$(BUN) test
 
-win-installer:
-	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1
+# Version stamp for release artifacts: exact git tag on tag builds, else the
+# short SHA. Matches the naming used by qcontrol's macOS pkg.
+PKG_VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
+
+# Build the macOS installer package from the already-built bin/qctl. Run
+# `make build` first. Artifacts land in the ignored dist/ directory.
+pkg: build
+	scripts/macos-pkg/build.sh --binary $(BIN_DIR)/$(BINARY) --version $(PKG_VERSION) --output-dir dist
 
 clean:
 	rm -rf $(BIN_DIR)

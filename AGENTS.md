@@ -1,5 +1,18 @@
 # Repository Guidance
 
+## Source Layout
+
+Reusable wrapper logic lives in `src/core`: collector, forwarder contract,
+monitor host, qcontrol spawning, and the config/path helpers those pieces
+share. `src/forwarders` holds Forwarder implementations; `PrettyPrinter` is the
+default, and `--raw` selects `RawPrinter`. `src/lifecycle` owns start/stop placement. `src/platform` owns
+OS-specific adapters. Shared modules should import core pieces from
+`src/core/*` rather than growing a parallel copy.
+
+Tests colocate with the module they exercise (`src/core/collector.test.ts`
+next to `src/core/collector.ts`). Do not add a separate top-level `tests/`
+tree.
+
 ## Platform Boundaries
 
 Keep platform-specific behavior behind the platform adapter interfaces. Shared
@@ -15,11 +28,13 @@ When new OS-specific behavior is needed:
 
 Examples:
 
-- qcontrol config paths belong behind `PlatformAdapter.configPath()`.
+- qctl config/data/cache paths belong behind `configPath()`, `dataPath()`,
+  and `defaultCacheRoot()`.
 - collector endpoints belong behind `defaultCollectorEndpoint()` and `sinkUrl()`.
+- invoking-user identity for elevated runs belongs behind
+  `resolveInvokingUser()`.
 - executable names, cache paths, socket/pipe cleanup, and privilege behavior
   belong behind platform adapters.
 
-Installer and service-manager code may use native OS tools directly, but shared
-lifecycle orchestration should route platform decisions through platform
-lifecycle modules rather than inline platform checks.
+Shared start/stop orchestration should route platform placement through
+lifecycle adapters rather than inline service-manager checks.

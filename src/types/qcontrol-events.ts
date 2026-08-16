@@ -4,47 +4,56 @@
  */
 
 /**
- * One public record emitted by `qcontrol run`.
+ * One canonical event record written to monitor-owned public sinks.
  */
-export type RunRecord = (
-  | RunStartedEvent
-  | McpEvent
-  | IoEvent
-  | LlmEvent
-  | AgentEvent
-  | RunDiagnosticEvent
-  | CustomPluginEvent
-) & {
+export type EventRecord = EntityRecord | HostRecord;
+/**
+ * Common envelope for one process-scoped event.
+ */
+export type EntityRecord = EntityRecord1 & {
   /**
    * RFC3339Nano event timestamp.
    */
   timestamp: Timestamp;
   /**
-   * Event severity for generic display and filtering.
+   * Event severity for display and filtering.
    *
    * @default "info"
    */
   severity?: Severity;
   /**
-   * Compact context for the owning `qcontrol run` invocation.
+   * Opaque identity of the owning OS process lifetime.
    */
-  run: RunContext;
+  entity_id: string;
 };
+export type EntityRecord1 =
+  | ProcessEvent
+  | McpEvent
+  | IoEvent
+  | LlmEvent
+  | AgentEvent
+  | RunDiagnosticEvent
+  | CustomPluginEvent;
 /**
- * Run lifecycle event produced by `qcontrol run` itself.
+ * Public process lifecycle events.
  */
-export type RunStartedEvent = {
-  type: "run.started";
-  payload: RunStarted;
-};
+export type ProcessEvent =
+  | {
+      type: "process.started";
+      payload: ProcessStarted;
+    }
+  | {
+      type: "process.stopped";
+      payload: ProcessStopped;
+    };
 /**
  * Agent kind.
  */
 export type AiSystemKind = "cli" | "ide" | "desktop_app" | "vscode_extension" | "other";
 /**
  * How a launch or scan candidate was attributed to an agent. Shared by the
- * detector (`qagents`) and the public `run.started.payload.agent.matches`
- * output, so the granular detection reason reaches consumers unchanged.
+ * detector (`qagents`) and public process attribution, so the granular
+ * detection reason reaches consumers unchanged.
  */
 export type AgentMatchStrategy =
   | "executable_name"
@@ -56,6 +65,7 @@ export type AgentMatchStrategy =
  * Confidence in an agent match.
  */
 export type MatchConfidence = "low" | "medium" | "high";
+export type Timestamp = string;
 /**
  * One MCP observer event. Tagged on the wire `type` field; each variant's
  * payload is the direct `payload` object.
@@ -466,7 +476,6 @@ export type RunDiagnosticEvent =
       type: "run.agent_injection_failure";
       payload: AgentInjectionFailure;
     };
-export type Timestamp = string;
 /**
  * Event severity, ordered `Debug < Info < Warn < Error`.
  *
@@ -474,42 +483,134 @@ export type Timestamp = string;
  * drives both the tracing subscriber and the event emit-site filter.
  */
 export type Severity = "debug" | "info" | "warn" | "error";
+/**
+ * Common envelope for host inventory records.
+ */
+export type HostRecord = HostRecord1 & {
+  /**
+   * RFC3339Nano event timestamp.
+   */
+  timestamp: Timestamp;
+  /**
+   * Event severity for display and filtering.
+   *
+   * @default "info"
+   */
+  severity?: Severity;
+};
+export type HostRecord1 = InstallationEvent | ProcessInventoryEvent;
+/**
+ * Public installation inventory events.
+ */
+export type InstallationEvent =
+  | {
+      type: "installation.discovered";
+      payload: InstallationRecord;
+    }
+  | {
+      type: "installation.details";
+      payload: InstallationDetailsRecord;
+    }
+  | {
+      type: "installation.snapshot";
+      payload: InstallationSnapshot;
+    }
+  | {
+      type: "installation.tap_result";
+      payload: InstallationTapResult;
+    }
+  | {
+      type: "installation.tap_error";
+      payload: InstallationTapError;
+    }
+  | {
+      type: "installation.tap_skipped";
+      payload: InstallationTapSkipped;
+    };
+/**
+ * Product-level tap health independent of the active tap mechanism.
+ */
+export type InstallationTapStatus = "tapped" | "not_tapped" | "requires_attention";
+/**
+ * Normalized qtap outcomes.
+ */
+export type TapOutcome =
+  | ("fresh" | "no_op" | "refresh_shim" | "adopt_replaced" | "prune_and_tap" | "reclassified")
+  | "pending";
+/**
+ * Stable skip reasons carried by `installation.tap_skipped`.
+ */
+export type TapSkippedReason =
+  | "not_allowed"
+  | "missing_on_disk"
+  | "platform_mismatch"
+  | "no_installation"
+  | "protected_location";
+/**
+ * Public process inventory events that describe multiple entities.
+ */
+export type ProcessInventoryEvent = {
+  type: "process.snapshot";
+  payload: ProcessSnapshot;
+};
 
 /**
- * Flattened launch metadata for the root child process.
+ * A running process observed by the monitor.
  *
- * Emitted after the wrapped root child starts successfully; the launch anchor
- * for the run. Does not contain a process id; the spawned agent pid lives in
- * `run.agent_pid`.
+ * Unlike installation records, process events are detection-by-matching:
+ * the monitor enumerates the host process table and classifies each entry
+ * with the agent adapters, so identity carries the `matches` that
+ * attributed the process to an agent when recognized.
  */
-export interface RunStarted {
+export interface ProcessStarted {
   /**
-   * Resolved root command executable path.
+   * OS process id.
+   */
+  pid: number;
+  /**
+   * Metadata-derived installation id for the observed executable.
+   */
+  installation_id?: string | null;
+  /**
+   * Parent process id when known. Included for consumer-side correlation
+   * (e.g. recognizing agents launched by `qcontrol run`); the monitor
+   * itself does not filter on it.
+   */
+  ppid?: number | null;
+  /**
+   * Resolved executable path of the process.
    */
   exe: string;
   /**
-   * Original argv0 token used to launch the root child.
+   * Process command line as observed.
    */
-  cmd: string;
+  argv?: string[];
   /**
-   * Original argv1-and-later arguments used to launch the root child.
-   *
-   * @default []
+   * Working directory when known.
    */
-  args?: string[];
+  cwd?: string | null;
   /**
-   * Working directory used for the root child.
+   * Agent attribution when the process was recognized.
+   * Explicitly instrumented generic processes leave this absent.
    */
-  cwd: string;
+  agent?: ScanAgent | null;
   /**
-   * Agent attribution for the launched command.
+   * Why the process was attributed to the agent.
    */
-  agent?: RunAgentAttribution | null;
+  matches?: AiMatch[];
+  /**
+   * OS-reported process start time, as an RFC3339Nano timestamp.
+   */
+  started_at: Timestamp;
 }
 /**
- * Agent attribution for a launched root child.
+ * Agent identity attached to scan installation records by qagents.
+ *
+ * Scan agent objects do not carry a `match` array. Scan walks each agent
+ * adapter's own installation probes, so the agent identity is known by
+ * construction.
  */
-export interface RunAgentAttribution {
+export interface ScanAgent {
   /**
    * Canonical agent id.
    */
@@ -526,27 +627,37 @@ export interface RunAgentAttribution {
    * Agent kind.
    */
   kind: AiSystemKind;
-  /**
-   * Launch attribution matches.
-   */
-  matches: RunAgentMatch[];
+}
+export interface AiMatch {
+  strategy: AgentMatchStrategy;
+  value: string;
+  confidence: MatchConfidence;
 }
 /**
- * One reason the launched command was attributed to an agent.
+ * A running process that the monitor observed disappear from the host process
+ * table.
+ *
+ * Polling can only observe that the process is gone, so this event reports
+ * run duration rather than an exit status.
  */
-export interface RunAgentMatch {
+export interface ProcessStopped {
   /**
-   * Match strategy.
+   * OS process id.
    */
-  strategy: AgentMatchStrategy;
+  pid: number;
   /**
-   * Matched value. For `explicit_agent`, this is the canonical agent id.
+   * Resolved executable path of the process.
    */
-  value: string;
+  exe: string;
   /**
-   * Match confidence.
+   * OS-reported process start time, as an RFC3339Nano timestamp.
    */
-  confidence: MatchConfidence;
+  started_at: Timestamp;
+  /**
+   * Run duration from `started_at` to when the monitor observed the
+   * process gone, in milliseconds.
+   */
+  duration_ms: number;
 }
 /**
  * A JSON-RPC request.
@@ -2076,46 +2187,401 @@ export interface CustomPluginPayload {
   };
 }
 /**
- * Compact run context repeated on every run-produced event.
+ * One at-rest AI agent installation discovered by scan.
+ *
+ * This is an upsert/current-state record. If qcontrol changes or confirms tap
+ * state, the monitor can emit tap action events and then re-emit
+ * `installation.discovered` with updated tap state.
  */
-export interface RunContext {
+export interface InstallationRecord {
   /**
-   * Stable opaque id for this `qcontrol run` invocation.
-   */
-  id: string;
-  /**
-   * OS pid of the `qcontrol run` process.
-   */
-  run_pid: number;
-  /**
-   * OS pid of the spawned agent process.
-   */
-  agent_pid?: number | null;
-  /**
-   * RFC3339Nano timestamp captured once at startup.
-   */
-  started_at: Timestamp;
-  /**
-   * qcontrol version that produced the event.
-   */
-  version: string;
-  /**
-   * Effective plugin display names for the run.
+   * Re-creatable installation identity.
    *
-   * @default []
+   * Lower-case hex SHA-256 over a stable logical executable path
+   * (canonicalized, symlinks resolved), filename, and the created time,
+   * modified time, and size of the physical vendor binary, so the id joins
+   * captured events and `process.*` records for the same install across tap states
+   * and app-session layouts. For a tapped CLI the logical path and
+   * metadata are the original moved-aside binary (not the qcontrol shim at
+   * `executable_path`); for a tapped desktop app the logical path is the
+   * public app executable and the metadata comes from wherever the vendor
+   * bundle currently lives (its private parent at rest, the public path
+   * during a session). Absent only when executable metadata could not be
+   * read.
+   */
+  id?: string | null;
+  /**
+   * Agent identity.
+   */
+  agent: ScanAgent;
+  /**
+   * Discovered executable path.
+   */
+  executable_path: string;
+  /**
+   * Discovered app bundle or desktop app path.
+   */
+  app_path?: string | null;
+  /**
+   * Installation version when known.
+   */
+  version?: string | null;
+  /**
+   * Known config directory path when it exists.
+   */
+  config_path?: string | null;
+  /**
+   * Product-level tap state across every supported tap mechanism.
+   */
+  tap: InstallationTapState;
+}
+/**
+ * Product-level tap state independent of the active tap mechanism.
+ *
+ * Additional implementation-neutral state may be added here later. Tap
+ * mechanism paths and configuration remain private to qcontrol.
+ */
+export interface InstallationTapState {
+  /**
+   * Current product-level tap health.
+   */
+  status: InstallationTapStatus;
+}
+/**
+ * At-rest configuration details extracted from one discovered installation.
+ *
+ * Emitted only when scan runs with `--details`, after the corresponding
+ * `installation.discovered` record, and only for installations whose agent
+ * adapter supports inspection. Consumers join the two records on `id`.
+ * Extraction is metadata-only: details come from reading config files on
+ * disk, never from executing the discovered binary.
+ */
+export interface InstallationDetailsRecord {
+  /**
+   * Re-creatable installation identity, derived as on
+   * `installation.discovered`. Absent only when executable metadata could
+   * not be read.
+   */
+  id?: string | null;
+  /**
+   * Agent identity, identical to the joined `installation.discovered`
+   * record's `agent` block.
+   */
+  agent: ScanAgent;
+  /**
+   * Installation version derived from on-disk evidence (never from
+   * executing the binary).
+   */
+  version?: string | null;
+  /**
+   * Default model the installation is configured to use.
+   */
+  default_model?: string | null;
+  /**
+   * MCP servers registered for the installation, verbatim as found on
+   * disk. May contain live credentials (env values, headers); treat scan
+   * `--details` output as a secrets-bearing artifact.
+   */
+  mcp_servers?: McpServerDetail[];
+  /**
+   * Skills registered for the installation.
+   */
+  skills?: SkillDetail[];
+  /**
+   * Installed plugin identifiers.
    */
   plugins?: string[];
   /**
-   * Canonical AI agent id when one was resolved. Omitted for generic runs
-   * such as `--adapter none`.
+   * Agent-specific defaults that do not map to a shared typed field,
+   * keyed as found in the agent's own config files.
    */
-  agent_id?: string | null;
+  settings?: {
+    [k: string]: unknown;
+  };
   /**
-   * Content-derived installation id of the resolved agent binary, keyed on
-   * its canonical (symlink-resolved) path so it joins `process.*` and
-   * `installation.*` records for the same install. Present only when an AI
-   * agent was resolved; omitted for generic runs such as `--adapter none`.
-   * See `qtap::fingerprint::installation_id`.
+   * Human-readable notes for config sources that could not be read or
+   * parsed. Presence of warnings means the sibling fields are partial.
+   */
+  warnings?: string[];
+}
+/**
+ * One MCP server registration, verbatim as found in the agent's config.
+ */
+export interface McpServerDetail {
+  /**
+   * Server name as registered in the agent's config.
+   */
+  name: string;
+  /**
+   * Transport token as found in the config (for example `stdio`, `http`,
+   * `sse`), when the config declares one.
+   */
+  transport?: string | null;
+  /**
+   * Launch command for stdio servers.
+   */
+  command?: string | null;
+  /**
+   * Launch arguments for stdio servers.
+   */
+  args?: string[];
+  /**
+   * Endpoint URL for remote servers.
+   */
+  url?: string | null;
+  /**
+   * Environment variables, verbatim including values.
+   */
+  env?: {
+    [k: string]: unknown;
+  };
+  /**
+   * HTTP headers for remote servers, verbatim including values.
+   */
+  headers?: {
+    [k: string]: unknown;
+  };
+}
+/**
+ * One skill registered for an installation.
+ */
+export interface SkillDetail {
+  /**
+   * Skill name (directory or frontmatter name).
+   */
+  name: string;
+  /**
+   * Skill description when its definition declares one.
+   */
+  description?: string | null;
+}
+/**
+ * Authoritative set of installed AI agents observed by the monitor.
+ */
+export interface InstallationSnapshot {
+  /**
+   * Installed agents at the instant the host inventory was sampled.
+   */
+  installations: InstallationRecord[];
+}
+/**
+ * Successful, previewed, repaired, or confirmed tap action.
+ */
+export interface InstallationTapResult {
+  /**
+   * Re-creatable installation identity, derived as on
+   * `installation.discovered` from metadata of the original moved-aside
+   * binary. Absent when executable metadata could not be read.
+   */
+  id?: string | null;
+  /**
+   * Agent identity.
+   */
+  agent: ScanAgent;
+  /**
+   * Tap target path.
+   */
+  target: string;
+  /**
+   * Normalized qtap outcome.
+   */
+  outcome: TapOutcome;
+  /**
+   * Tap mechanism token.
+   */
+  tap_type?: string | null;
+  /**
+   * Shim path.
+   */
+  shim_path?: string | null;
+  /**
+   * Original target path.
+   */
+  original_path?: string | null;
+  /**
+   * Named tap mode when known (`observe` / `inspect` / `enforce`).
+   * Distinct from auto-tap allow-list "mode" surfaces.
+   */
+  mode?: string | null;
+  /**
+   * Explicit installation extra plugins (not mode recipe builtins).
+   */
+  plugins?: string[];
+  /**
+   * Non-mutating tap plan, present for dry-run results when available.
+   */
+  plan?: InstallationTapPlan | null;
+  /**
+   * Whether this was a non-mutating preview. `dry_run` is not an outcome:
+   * dry-run previews carry the predicted outcome and set `dry_run` to `true`.
+   */
+  dry_run: boolean;
+}
+/**
+ * Non-mutating tap plan attached to dry-run tap results when qtap can
+ * describe the filesystem operation before mutating disk.
+ */
+export interface InstallationTapPlan {
+  /**
+   * Target path evaluated for the tap operation.
+   */
+  target: string;
+  /**
+   * Path that will contain the qcontrol-managed shim.
+   */
+  shim_path: string;
+  /**
+   * Backup or moved-aside original path when the tap has one.
+   */
+  original_path?: string | null;
+  /**
+   * Stable restore action token for undoing the planned tap.
+   */
+  restore_action: string;
+  /**
+   * Filesystem capabilities required before the tap can proceed.
+   */
+  required_capabilities?: InstallationTapCapability[];
+}
+/**
+ * One filesystem capability required by a tap plan.
+ */
+export interface InstallationTapCapability {
+  /**
+   * Path whose access will be checked.
+   */
+  path: string;
+  /**
+   * Required capability label, such as `write/search`.
+   */
+  required: string;
+}
+/**
+ * Failed tap action.
+ *
+ * `installation.tap_error` does not carry a stable error-kind taxonomy in this
+ * schema.
+ */
+export interface InstallationTapError {
+  /**
+   * Re-creatable installation identity, derived as on
+   * `installation.discovered`. Absent when executable metadata could not be
+   * read (common for tap errors where the binary is missing).
+   */
+  id?: string | null;
+  /**
+   * Agent identity.
+   */
+  agent: ScanAgent;
+  /**
+   * Tap target path.
+   */
+  target: string;
+  /**
+   * Tap mechanism token.
+   */
+  tap_type?: string | null;
+  /**
+   * Named tap mode when known.
+   */
+  mode?: string | null;
+  /**
+   * Explicit installation extra plugins (not mode recipe builtins).
+   */
+  plugins?: string[];
+  /**
+   * Whether this was a non-mutating preview.
+   */
+  dry_run: boolean;
+  /**
+   * Human-readable error text.
+   */
+  error: string;
+}
+/**
+ * Intentionally skipped tap action.
+ */
+export interface InstallationTapSkipped {
+  /**
+   * Re-creatable installation identity, derived as on
+   * `installation.discovered`. Absent when executable metadata could not be
+   * read — notably for `missing_on_disk`, which by definition has no binary.
+   */
+  id?: string | null;
+  /**
+   * Agent identity.
+   */
+  agent: ScanAgent;
+  /**
+   * Tap target path, when one was known.
+   */
+  target?: string | null;
+  /**
+   * Stable skip reason.
+   */
+  reason: TapSkippedReason;
+  /**
+   * Whether this was part of a non-mutating preview.
+   */
+  dry_run: boolean;
+}
+/**
+ * Authoritative set of running processes observed by the monitor.
+ *
+ * The monitor emits this at startup and after an explicit snapshot request so
+ * consumers can replace stale process state before applying lifecycle deltas.
+ */
+export interface ProcessSnapshot {
+  /**
+   * Running processes at the instant the host process table was sampled.
+   */
+  processes: ProcessSnapshotEntry[];
+}
+/**
+ * One process entry in an authoritative process snapshot.
+ */
+export interface ProcessSnapshotEntry {
+  /**
+   * Opaque identity of this OS process lifetime.
+   */
+  entity_id: string;
+  /**
+   * OS process id.
+   */
+  pid: number;
+  /**
+   * Metadata-derived installation id for the observed executable.
    */
   installation_id?: string | null;
+  /**
+   * Parent process id when known. Included for consumer-side correlation
+   * (e.g. recognizing agents launched by `qcontrol run`); the monitor
+   * itself does not filter on it.
+   */
+  ppid?: number | null;
+  /**
+   * Resolved executable path of the process.
+   */
+  exe: string;
+  /**
+   * Process command line as observed.
+   */
+  argv?: string[];
+  /**
+   * Working directory when known.
+   */
+  cwd?: string | null;
+  /**
+   * Agent attribution when the process was recognized.
+   * Explicitly instrumented generic processes leave this absent.
+   */
+  agent?: ScanAgent | null;
+  /**
+   * Why the process was attributed to the agent.
+   */
+  matches?: AiMatch[];
+  /**
+   * OS-reported process start time, as an RFC3339Nano timestamp.
+   */
+  started_at: Timestamp;
 }

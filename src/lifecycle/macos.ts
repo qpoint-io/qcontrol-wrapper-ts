@@ -1,90 +1,191 @@
 /**
- * Implements the launchd-backed lifecycle command graph used by qctl on macOS.
+ * launchd placement for `qctl start --service` and the matching `qctl stop`.
+ *
+ * Registers a system LaunchDaemon that runs `qctl start -f` as root with the
+ * invoking user's config environment. Stop boots the job out and removes the
+ * plist.
  */
-import type { InstallationActions, InstallationDependencies } from "./types";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
-/** Options that bind generic lifecycle wiring to launchd-specific operations. */
-export interface MacosLifecycleOptions {
-  buildLaunchDaemonPlist: (options: { includeUserConfigEnvironment?: boolean; socketPath?: string }) => string;
-  dependencies: InstallationDependencies;
-  isLaunchDaemonLoaded: () => Promise<boolean>;
-  launchDaemonPath: string;
-  launchDaemonTarget: string;
-  systemQctlSocketPath: () => string;
+import { getQctlEnvironment } from "../core/paths";
+import { platformAdapter } from "../platform";
+import { isCompiledWrapper, isPrivileged, runCommand, wrapperForegroundCommand } from "./process";
+import { writeLifecycleState } from "./state";
+import type { RuntimeOptions } from "./runtime";
+
+const LAUNCH_DAEMON_LABEL = "com.qpoint.qctl";
+const LAUNCH_DAEMON_PATH = `/Library/LaunchDaemons/${LAUNCH_DAEMON_LABEL}.plist`;
+const LAUNCH_DAEMON_TARGET = `system/${LAUNCH_DAEMON_LABEL}`;
+const LAUNCHD_LOG_DIR = "/Library/Logs/qctl";
+
+/** Escapes launchd plist string values without taking a dependency on plist IO. */
+function escapePlistString(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
-/** Creates launchd lifecycle helpers around explicit dependencies. */
-export function createMacosLifecycleActions(options: MacosLifecycleOptions): InstallationActions {
-  const { dependencies } = options;
+/** Builds the LaunchDaemon plist that keeps `qctl start -f` alive. */
+export function buildLaunchDaemonPlist(
+  command = wrapperForegroundCommand(),
+  env = getQctlEnvironment(),
+): string {
+  const programArguments = command
+    .map((value) => `    <string>${escapePlistString(value)}</string>`)
+    .join("\n");
+  const environment = Object.entries(env)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .filter(([key]) => [
+      "HOME",
+      "SUDO_USER",
+      "QCONTROL_CONFIG_DIR",
+      "QCONTROL_DATA_DIR",
+      "QCONTROL_CACHE_DIR",
+      "QCTL_CONFIG_DIR",
+      "QCTL_DATA_DIR",
+      "QCTL_CACHE_DIR",
+      "QCTL_SOCKET_PATH",
+      "XDG_CONFIG_HOME",
+    ].includes(key))
+    .map(([key, value]) => `    <key>${escapePlistString(key)}</key>\n    <string>${escapePlistString(value)}</string>`)
+    .join("\n");
 
-  const installSystem = async (): Promise<number> => {
-    const initExitCode = await dependencies.runQcontrolAsRoot({ args: ["init", "--system"] });
-    if (initExitCode !== 0) {
-      return initExitCode;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCH_DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+${programArguments}
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+${environment}
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>${escapePlistString(`${LAUNCHD_LOG_DIR}/stdout.log`)}</string>
+  <key>StandardErrorPath</key>
+  <string>${escapePlistString(`${LAUNCHD_LOG_DIR}/stderr.log`)}</string>
+</dict>
+</plist>
+`;
+}
+
+/** Runs a launchctl or install command, prefixing sudo when this process is not root. */
+async function runPrivileged(command: string[], stdio: Bun.SpawnOptions.Readable = "inherit"): Promise<number> {
+  if (isPrivileged()) {
+    return runCommand(command, stdio);
+  }
+
+  return runCommand(["sudo", "--", ...command], stdio);
+}
+
+/** Installs the plist, bootstraps it, and kickstarts the job. */
+export async function startLaunchd(options: RuntimeOptions = {}): Promise<number> {
+  if (!isCompiledWrapper()) {
+    console.error("qctl start --service must run from the compiled qctl binary");
+    return 1;
+  }
+
+  if (!platformAdapter.resolveInvokingUser()) {
+    console.error("qctl start --service could not resolve the invoking user; run it with sudo from your account");
+    return 1;
+  }
+
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "qctl-launchd-"));
+  const temporaryPlist = join(temporaryDirectory, `${LAUNCH_DAEMON_LABEL}.plist`);
+
+  try {
+    await writeFile(temporaryPlist, buildLaunchDaemonPlist(wrapperForegroundCommand(options)), { mode: 0o644 });
+
+    let exitCode = await runPrivileged([
+      "/usr/bin/install",
+      "-d",
+      "-o",
+      "root",
+      "-g",
+      "wheel",
+      "-m",
+      "755",
+      dirname(LAUNCH_DAEMON_PATH),
+      LAUNCHD_LOG_DIR,
+    ]);
+    if (exitCode !== 0) {
+      return exitCode;
     }
 
-    return dependencies.installLaunchDaemon(options.buildLaunchDaemonPlist({
-      includeUserConfigEnvironment: false,
-      socketPath: options.systemQctlSocketPath(),
-    }));
-  };
-
-  const initUser = async (): Promise<number> => {
-    const initExitCode = await dependencies.runQcontrol({ args: ["init", "--user"] });
-    if (initExitCode !== 0) {
-      return initExitCode;
+    exitCode = await runPrivileged([
+      "/usr/bin/install",
+      "-o",
+      "root",
+      "-g",
+      "wheel",
+      "-m",
+      "644",
+      temporaryPlist,
+      LAUNCH_DAEMON_PATH,
+    ]);
+    if (exitCode !== 0) {
+      return exitCode;
     }
 
-    await dependencies.appendQctlSinkConfig();
-    return 0;
-  };
+    const loaded = (await runPrivileged(["launchctl", "print", LAUNCH_DAEMON_TARGET], "ignore")) === 0;
+    if (!loaded) {
+      exitCode = await runPrivileged(["launchctl", "enable", LAUNCH_DAEMON_TARGET], "ignore");
+      if (exitCode !== 0) {
+        // enable can fail on a never-seen label; bootstrap still creates it.
+      }
 
-  const install = async (): Promise<number> => {
-    const systemExitCode = await installSystem();
-    if (systemExitCode !== 0) {
-      return systemExitCode;
-    }
-
-    return initUser();
-  };
-
-  const uninstallSystem = async (): Promise<number> => {
-    return dependencies.removeLaunchDaemon();
-  };
-
-  const uninstall = async (): Promise<number> => {
-    const launchDaemonExitCode = await uninstallSystem();
-    if (launchDaemonExitCode !== 0) {
-      return launchDaemonExitCode;
-    }
-
-    await dependencies.removeQctlSinkConfig();
-    return 0;
-  };
-
-  const start = async (): Promise<number> => {
-    if (!(await options.isLaunchDaemonLoaded())) {
-      const bootstrapExitCode = await dependencies.runAsRoot([
-        "launchctl",
-        "bootstrap",
-        "system",
-        options.launchDaemonPath,
-      ]);
-      if (bootstrapExitCode !== 0) {
-        return bootstrapExitCode;
+      exitCode = await runPrivileged(["launchctl", "bootstrap", "system", LAUNCH_DAEMON_PATH]);
+      if (exitCode !== 0) {
+        return exitCode;
       }
     }
 
-    return dependencies.runAsRoot(["launchctl", "kickstart", "-k", options.launchDaemonTarget]);
-  };
-
-  const stop = async (): Promise<number> => {
-    if (!(await options.isLaunchDaemonLoaded())) {
-      return 0;
+    exitCode = await runPrivileged(["launchctl", "kickstart", "-k", LAUNCH_DAEMON_TARGET]);
+    if (exitCode !== 0) {
+      return exitCode;
     }
 
-    return dependencies.runAsRoot(["launchctl", "bootout", options.launchDaemonTarget]);
-  };
+    await writeLifecycleState({ manager: "launchd" });
+    console.log("qctl started (launchd)");
+    return 0;
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
 
-  return { dependencies, install, installSystem, initUser, start, stop, uninstall, uninstallSystem };
+/** Unloads the LaunchDaemon and deletes its plist. Missing jobs are success. */
+export async function stopLaunchd(): Promise<number> {
+  const loaded = (await runPrivileged(["launchctl", "print", LAUNCH_DAEMON_TARGET], "ignore")) === 0;
+  if (loaded) {
+    const exitCode = await runPrivileged(["launchctl", "bootout", LAUNCH_DAEMON_TARGET]);
+    if (exitCode !== 0) {
+      return exitCode;
+    }
+  }
+
+  const removeExitCode = await runPrivileged(["/bin/rm", "-f", LAUNCH_DAEMON_PATH]);
+  if (removeExitCode !== 0) {
+    return removeExitCode;
+  }
+
+  console.log("qctl stopped (launchd)");
+  return 0;
 }

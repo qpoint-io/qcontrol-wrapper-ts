@@ -5,8 +5,10 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 
-import embeddedQcontrolPath from "../bin/qcontrol.bin" with { type: "file" };
-import { createPlatformAdapter, platformAdapter, type PlatformAdapter } from "./platform";
+import embeddedQcontrolPath from "../../bin/qcontrol.bin" with { type: "file" };
+import { ensureQctlLayout } from "./config";
+import { QCONTROL_PRESERVED_ENV, getQctlEnvironment } from "./paths";
+import { createPlatformAdapter, platformAdapter, type PlatformAdapter } from "../platform";
 
 /** Controls where the embedded qcontrol executable is materialized. */
 export interface QcontrolBundleOptions {
@@ -139,16 +141,31 @@ export async function getQcontrolPath(options: QcontrolBundleOptions = {}): Prom
 
 /** Spawns qcontrol directly with caller-provided stdio, env, and arguments. */
 export async function spawnQcontrol(options: RunQcontrolOptions = {}): Promise<Bun.Subprocess> {
-  const qcontrolPath = await getQcontrolPath(options);
-
-  return spawnCommand([qcontrolPath, ...(options.args ?? [])], options);
+  const prepared = await prepareQcontrolRun(options);
+  return spawnCommand([prepared.qcontrolPath, ...(options.args ?? [])], prepared);
 }
 
 /** Spawns qcontrol through sudo for commands that need privileged setup. */
 export async function spawnQcontrolAsRoot(options: RunQcontrolOptions = {}): Promise<Bun.Subprocess> {
-  const qcontrolPath = await getQcontrolPath(options);
+  const prepared = await prepareQcontrolRun(options);
+  return spawnCommand(
+    ["sudo", `--preserve-env=${QCONTROL_PRESERVED_ENV}`, "--", prepared.qcontrolPath, ...(options.args ?? [])],
+    prepared,
+  );
+}
 
-  return spawnCommand(["sudo", "--", qcontrolPath, ...(options.args ?? [])], options);
+/**
+ * Materializes the binary, seeds qctl's config tree, and binds qcontrol to
+ * those directories before any child is launched.
+ */
+async function prepareQcontrolRun(options: RunQcontrolOptions): Promise<RunQcontrolOptions & { qcontrolPath: string }> {
+  await ensureQctlLayout(options.platform);
+  const qcontrolPath = await getQcontrolPath(options);
+  return {
+    ...options,
+    qcontrolPath,
+    env: options.env ?? getQctlEnvironment(options.platform),
+  };
 }
 
 /** Centralizes Bun spawn defaults so every qcontrol path inherits CLI behavior. */

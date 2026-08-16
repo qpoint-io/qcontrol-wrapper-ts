@@ -1,16 +1,12 @@
 /**
  * Shares POSIX endpoint and executable behavior used by macOS and Linux while
- * leaving platform identity and cache defaults to the concrete adapters.
+ * leaving platform identity to the concrete adapters.
  */
 import { chmod, lstat, mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
 
-import type { PlatformAdapter } from "./types";
-
-const RUNTIME_SOCKET_DIR = "/var/run/qctl";
-const RUNTIME_SOCKET_NAME = "collector.sock";
+import type { InvokingUser, PlatformAdapter } from "./types";
 
 /** Narrows filesystem failures to Node errno errors without trusting throws. */
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
@@ -41,12 +37,22 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
 /** Options that make a POSIX adapter concrete for one supported platform. */
 interface PosixPlatformOptions {
   kind: "macos" | "linux";
-  defaultCacheRoot: (env: NodeJS.ProcessEnv) => string;
+}
+
+/** Resolves a non-root user's home when sudo has replaced HOME with root's. */
+function defaultHomeForUsername(kind: "macos" | "linux", username: string): string {
+  return kind === "macos" ? `/Users/${username}` : `/home/${username}`;
+}
+
+/** Home used for qctl directories, preferring the sudo invoking user. */
+function directoryHome(adapter: Pick<PlatformAdapter, "resolveInvokingUser">, kind: "macos" | "linux", env: NodeJS.ProcessEnv): string {
+  const user = adapter.resolveInvokingUser(env);
+  return user?.home ?? env.HOME ?? homedir();
 }
 
 /** Creates the POSIX adapter behavior shared by macOS and Linux. */
 export function createPosixPlatformAdapter(options: PosixPlatformOptions): PlatformAdapter {
-  return {
+  const adapter: PlatformAdapter = {
     kind: options.kind,
     qcontrolExecutableName: "qcontrol",
 
@@ -58,7 +64,7 @@ export function createPosixPlatformAdapter(options: PosixPlatformOptions): Platf
       await chmod(endpointPath, mode);
     },
 
-    canUseRootScanner() {
+    canElevateMonitor() {
       return true;
     },
 
@@ -68,22 +74,48 @@ export function createPosixPlatformAdapter(options: PosixPlatformOptions): Platf
       }
 
       if (env.XDG_CONFIG_HOME) {
-        return join(env.XDG_CONFIG_HOME, "qcontrol");
+        return join(env.XDG_CONFIG_HOME, "qctl");
       }
 
-      return join(homedir(), ".config", "qcontrol");
+      return join(directoryHome(adapter, options.kind, env), ".config", "qctl");
+    },
+
+    dataPath(env = process.env) {
+      if (env.QCTL_DATA_DIR || env.QCTL_STATE_DIR) {
+        return env.QCTL_DATA_DIR ?? env.QCTL_STATE_DIR as string;
+      }
+
+      const home = directoryHome(adapter, options.kind, env);
+      if (options.kind === "macos") {
+        return join(home, "Library", "Application Support", "qctl");
+      }
+
+      if (env.XDG_DATA_HOME) {
+        return join(env.XDG_DATA_HOME, "qctl");
+      }
+
+      return join(home, ".local", "share", "qctl");
     },
 
     defaultCacheRoot(env = process.env) {
-      if (env.QCONTROL_WRAPPER_CACHE_DIR) {
-        return env.QCONTROL_WRAPPER_CACHE_DIR;
+      if (env.QCTL_CACHE_DIR || env.QCONTROL_WRAPPER_CACHE_DIR) {
+        return env.QCTL_CACHE_DIR ?? env.QCONTROL_WRAPPER_CACHE_DIR as string;
       }
 
-      return options.defaultCacheRoot(env);
+      if (env.XDG_CACHE_HOME) {
+        return join(env.XDG_CACHE_HOME, "qctl");
+      }
+
+      const home = directoryHome(adapter, options.kind, env);
+      if (options.kind === "macos") {
+        return join(home, "Library", "Caches", "qctl");
+      }
+
+      return join(home, ".cache", "qctl");
     },
 
     defaultCollectorEndpoint(env = process.env) {
-      return env.QCTL_SOCKET_PATH ?? join(RUNTIME_SOCKET_DIR, RUNTIME_SOCKET_NAME);
+      return env.QCTL_SOCKET_PATH ?? join(adapter.dataPath(env), "collector.sock");
     },
 
     async cleanupCollectorEndpoint(endpointPath) {
@@ -99,8 +131,18 @@ export function createPosixPlatformAdapter(options: PosixPlatformOptions): Platf
       await chmod(binaryPath, 0o755);
     },
 
-    qctlSinkUrls(currentEndpoint, legacyPosixEndpoint) {
-      return [this.sinkUrl(currentEndpoint), this.sinkUrl(legacyPosixEndpoint)];
+    resolveInvokingUser(env = process.env): InvokingUser | undefined {
+      const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+      const username = env.SUDO_USER || (uid !== 0 ? (env.USER || env.LOGNAME) : undefined);
+      if (!username || username === "root") {
+        return undefined;
+      }
+
+      const home = env.SUDO_USER
+        ? defaultHomeForUsername(options.kind, username)
+        : (env.HOME ?? homedir());
+
+      return { username, home };
     },
 
     shouldOpenDaemonEndpoint() {
@@ -108,7 +150,12 @@ export function createPosixPlatformAdapter(options: PosixPlatformOptions): Platf
     },
 
     sinkUrl(endpointPath) {
-      return `unix://${pathToFileURL(endpointPath).pathname}`;
+      // qcontrol strips the `unix://` prefix and uses the remainder as a
+      // filesystem path. Do not percent-encode: macOS data lives under
+      // `Application Support`, and `%20` would point at a different file.
+      return `unix://${endpointPath}`;
     },
   };
+
+  return adapter;
 }

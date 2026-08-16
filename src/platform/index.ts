@@ -6,7 +6,7 @@ import { createMacosPlatformAdapter } from "./macos";
 import { createLinuxPlatformAdapter } from "./linux";
 import { createWindowsPlatformAdapter } from "./windows";
 
-export type { PlatformAdapter } from "./types";
+export type { InvokingUser, PlatformAdapter } from "./types";
 
 /** Creates a platform adapter for explicit tests or the current host. */
 export function createPlatformAdapter(platform: NodeJS.Platform = process.platform) {
