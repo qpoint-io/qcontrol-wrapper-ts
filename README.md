@@ -1,220 +1,106 @@
-# qcontrol wrapper template
+# qcontrol wrapper reference
 
-This repository is a working TypeScript wrapper around `qcontrol` for applications that need to collect qcontrol events and report them to a custom destination. Keep the wrapper, collector, monitor host, and embedded qcontrol handling in place, then implement your product-specific reporting logic as a forwarder.
+You are wrapping [qcontrol](https://qpoint.io) with a custom application — to white-label it, or to add additional business logic on the event stream it produces. This repository is a reference-only example of doing just that.
 
-The default implementation already handles the parts that should not need to be rebuilt for each integration:
+Anything this app does can be copied, or used only as a reference. Ignore any part. Bring your own language, layout, packaging, or patterns. The stack here (Bun, TypeScript, a CLI named `qctl`) is incidental.
 
-- bundles and materializes the upstream `qcontrol` binary
-- proxies unknown CLI commands through to `qcontrol`
-- creates qctl-owned config, data, and cache directories
-- writes `config.toml` with a fleet sink pointing at qctl's collector
-- starts `qcontrol start -f` so the elevated monitor owns inventory, taps, and event fan-out
-- collects newline-delimited JSON records from a local socket or named pipe
-- resolves installation and process context before delivery
-- forwards complete event records to one or more `Forwarder` implementations
+## What has to happen
 
-qctl creates its own directories and config; qcontrol is pointed at them through `QCONTROL_CONFIG_DIR`, `QCONTROL_DATA_DIR`, and `QCONTROL_CACHE_DIR`. On macOS, `make pkg` builds a `.pkg` that installs `qctl` to `/usr/local/bin` and runs `qctl init` then `qctl start --service` from postinstall.
+At a high level, a wrapper owns qcontrol as a bundled child, not as a separate product the user installs. When your app starts, this is the sequence that needs to occur:
 
-## Architecture
+1. **Generate a qcontrol config** that names a socket (or named pipe) your app will listen on. qcontrol writes events to that sink; your app does not poll qcontrol for them.
+2. **Bind a listener on that socket first.** qcontrol connects as soon as its monitor starts, so the endpoint has to exist before the child is launched.
+3. **Materialize the bundled qcontrol binary and run it as a subprocess** (`qcontrol start -f`). On macOS and Linux the monitor usually needs root, so this app re-execs through `sudo` before spawning that child.
+4. **Handle events as they arrive.** This is where white-label behavior and custom business logic live. In this repo that is a `Forwarder`; the default implementation just pretty-prints the stream.
 
-`qctl` is the wrapper binary built from `src/main.ts`. Wrapper-owned commands match qcontrol's start surface:
+Run events join back to a process (`entity_id`) and from there to an installed agent (`installation_id`). The [event schema](guides/event-schema.md#how-events-join) is the model; the [collector](guides/handling-events.md#connecting-events-to-processes-and-installations) is one implementation of the two lookup tables.
 
-- `qctl start` — start in the background
-- `qctl start -f` — run in this terminal
-- `qctl start --service` — register an OS service and start now
-- `qctl status` — show whether qctl is running, and the pid when it is
-- `qctl stop` — stop, and remove the service if one was registered
+This app's example "business logic" is printing events. Replace that. Keep, rewrite, or throw away everything around it.
 
-Foreground runs print one summary line per event. Pass `--raw` to print JSON lines instead. Every other argument vector is passed through to the embedded `qcontrol` binary unchanged. Do not inject `--sink` on `qcontrol run`: fleet destinations live in `config.toml`, and the running monitor fans events out to those sinks.
+## Guides
 
-At runtime `start -f` starts two components:
+This repo is structured as a reference for the things a real wrapper might need. Every task is optional. Steal the pieces you care about:
 
-1. `Collector` listens on qctl's local sink.
-2. `Monitor` runs `qcontrol start -f` so qcontrol's elevated monitor writes the unified event stream to that sink.
+- [Fetching and bundling the latest qcontrol](guides/bundling-qcontrol.md)
+- [Running qcontrol, and forwarding commands transparently](guides/running-qcontrol.md)
+- [Understanding the event schema and fetching the latest](guides/event-schema.md)
+- [Binding to the event socket and handling events](guides/handling-events.md)
+- [Running the app as a daemonized service](guides/daemon-service.md)
+- [Building a native macOS installer package](guides/macos-installer.md)
+- [Re-generating a snapshot if the listener gets stale](guides/snapshots.md)
 
-The collector receives qcontrol's socket records, parses each JSON event, resolves dependency records, and calls the configured forwarders.
+## Reference
 
-## Custom logic belongs in a forwarder
+Index of the files a builder is most likely to open. Each entry is what that file does in *this* app, not a prescription for yours.
 
-Do not replace the collector, monitor host, socket protocol, or qcontrol spawning code unless the platform behavior itself needs to change. Those pieces are the reusable foundation of this template.
+### Core
 
-Application-specific behavior should live behind the `Forwarder` interface in `src/core/forwarder.ts`:
+| File | Role |
+|---|---|
+| [`src/core/config.ts`](src/core/config.ts) | Creates the wrapper's config/data/cache directories and seeds `config.toml` with a fleet sink pointing at the collector. |
+| [`src/core/paths.ts`](src/core/paths.ts) | Resolves the collector endpoint and the `QCONTROL_*` environment every qcontrol child inherits. |
+| [`src/core/qcontrol.ts`](src/core/qcontrol.ts) | Materializes the embedded qcontrol binary into a cache and exposes spawn/run helpers. |
+| [`src/core/monitor.ts`](src/core/monitor.ts) | Owns the long-running `qcontrol start -f` subprocess. |
+| [`src/core/collector.ts`](src/core/collector.ts) | Binds the local sink, parses newline-delimited JSON, resolves installation/process context, and calls forwarders. |
+| [`src/core/forwarder.ts`](src/core/forwarder.ts) | The `Forwarder` contract and the event / installation / process types handlers receive. |
+| [`src/core/index.ts`](src/core/index.ts) | Re-exports the core modules. |
 
-```ts
-export interface Forwarder {
-  forward(
-    event: QcontrolEvent,
-    installation?: QcontrolInstallation,
-    process?: QcontrolProcess,
-  ): void;
-}
-```
+### Event handling
 
-A forwarder receives the parsed qcontrol event and any context the collector was able to resolve. This is where you should transform events, filter noise, enrich payloads for your backend, write to logs, publish to a queue, or call an API.
+| File | Role |
+|---|---|
+| [`src/types/qcontrol-events.ts`](src/types/qcontrol-events.ts) | Generated unified monitor schema. Do not edit by hand. |
+| [`src/forwarders/pretty.ts`](src/forwarders/pretty.ts) | Default forwarder: one summary line per event on stdout. |
+| [`src/forwarders/raw.ts`](src/forwarders/raw.ts) | Alternate forwarder: one JSON object per line, with resolved context attached. |
+| [`src/forwarders/summarize.ts`](src/forwarders/summarize.ts) | Per-type one-line summaries used by the pretty printer. |
+| [`src/forwarders/text.ts`](src/forwarders/text.ts) | Truncation helpers for terminal output. |
+| [`src/forwarders/index.ts`](src/forwarders/index.ts) | Re-exports the example forwarders. |
 
-A typical custom forwarder looks like this:
+### Service lifecycle
 
-```ts
-import {
-  type Forwarder,
-  type QcontrolEvent,
-  type QcontrolInstallation,
-  type QcontrolProcess,
-} from "./core/forwarder";
+| File | Role |
+|---|---|
+| [`src/lifecycle/index.ts`](src/lifecycle/index.ts) | `start` / `stop` / `status` orchestration and platform service routing. |
+| [`src/lifecycle/mode.ts`](src/lifecycle/mode.ts) | Parses `start` flags into foreground, detached, or service placement. |
+| [`src/lifecycle/runtime.ts`](src/lifecycle/runtime.ts) | In-process collector-plus-monitor loop (`start -f`). Wires the example forwarder. |
+| [`src/lifecycle/direct.ts`](src/lifecycle/direct.ts) | Detached background start: spawn `start -f` and return. |
+| [`src/lifecycle/macos.ts`](src/lifecycle/macos.ts) | Registers a LaunchDaemon that runs `start -f`. |
+| [`src/lifecycle/linux.ts`](src/lifecycle/linux.ts) | Registers a systemd unit that runs `start -f`. |
+| [`src/lifecycle/windows.ts`](src/lifecycle/windows.ts) | Registers a Windows service whose binPath is `start -f`. |
+| [`src/lifecycle/state.ts`](src/lifecycle/state.ts) | Pid file and service-manager marker so `stop` and `status` know what was placed. |
+| [`src/lifecycle/process.ts`](src/lifecycle/process.ts) | Privilege checks, sudo re-exec, and the argv used to re-invoke this wrapper. |
 
-export class CustomForwarder implements Forwarder {
-  forward(
-    event: QcontrolEvent,
-    installation?: QcontrolInstallation,
-    process?: QcontrolProcess,
-  ): void {
-    // Send the event to your destination here.
-  }
-}
-```
+### Platform and packaging
 
-Then wire it into `runForeground()` in `src/lifecycle/runtime.ts` in place of
-the default `PrettyPrinter` from `src/forwarders/pretty.ts`:
+| File | Role |
+|---|---|
+| [`src/platform/types.ts`](src/platform/types.ts) | `PlatformAdapter` contract: paths, sink URL, elevation, socket/pipe prep. |
+| [`src/platform/index.ts`](src/platform/index.ts) | Selects the adapter for the current OS. |
+| [`src/platform/posix.ts`](src/platform/posix.ts) | Shared macOS/Linux paths, Unix sockets, and executable bits. |
+| [`src/platform/macos.ts`](src/platform/macos.ts) | macOS adapter. |
+| [`src/platform/linux.ts`](src/platform/linux.ts) | Linux adapter. |
+| [`src/platform/windows.ts`](src/platform/windows.ts) | Windows paths and named-pipe sinks. |
+| [`src/main.ts`](src/main.ts) | CLI entry: owns `start` / `status` / `stop`, forwards every other command to qcontrol. |
+| [`src/assets.d.ts`](src/assets.d.ts) | TypeScript declaration so Bun can embed `*.bin` files. |
+| [`scripts/download-qcontrol.sh`](scripts/download-qcontrol.sh) | Fetches a platform qcontrol tarball into `bin/qcontrol.bin`. |
+| [`scripts/sync-qcontrol-types.sh`](scripts/sync-qcontrol-types.sh) | Downloads the published TypeScript event schema. |
+| [`scripts/macos-pkg/build.sh`](scripts/macos-pkg/build.sh) | Builds a macOS `.pkg` from an already-compiled wrapper binary. |
+| [`scripts/macos-pkg/inspect.sh`](scripts/macos-pkg/inspect.sh) | Prints and smoke-checks a built `.pkg`. |
 
-```ts
-const forwarder = new CustomForwarder();
-const collector = new Collector({
-  forwarders: [forwarder],
-  socketMode: platformAdapter.shouldOpenDaemonEndpoint() ? 0o666 : undefined,
-});
-```
+## Running this repo locally
 
-You can pass multiple forwarders if you need fan-out. They are called in array order.
-
-## Event context
-
-qcontrol emits a single monitor stream. Host records (`installation.*`, `process.snapshot`) describe inventory. Entity records (`process.started`, `process.stopped`, `llm.*`, `agent.*`, `mcp.*`, `io.*`, and similar) carry a required top-level `entity_id` that identifies one OS process lifetime.
-
-Treat `entity_id` as opaque. The collector copies it from qcontrol; it never invents or parses the value.
-
-The collector keeps indexes of discovered installations and live processes so downstream forwarders do not need to rebuild that resolution.
-
-The forwarder arguments mean:
-
-- `event`: the parsed qcontrol event object exactly as received from the socket sink.
-- `installation`: the installation payload associated with the event, when available.
-- `process`: the process payload associated with the event, when available.
-
-`installation.discovered` forwards immediately. `process.started` waits only when it names an `installation_id` that has not been seen yet. Capture events wait on `entity_id` until the matching `process.started` or `process.snapshot` entry exists. Installation context is attached when the process has an `installation_id`; it is not required.
-
-`installation.snapshot` and `process.snapshot` replace the collector's current inventory. Request a fresh snapshot from a running monitor with `qcontrol monitor --snapshot` after reconnecting.
-
-Unresolved events are queued briefly to handle out-of-order delivery. The default queue TTL is five minutes and the default maximum queue size is 10,000 events.
-
-## Event types
-
-The forwarder arguments are fully typed. `QcontrolEvent` is a discriminated union over the unified monitor schema, so narrowing on `event.type` gives you the concrete payload type — no casts needed. Payload types can also be imported by name for handler signatures:
-
-```ts
-import type { InstallationRecord, LlmRequest } from "./types/qcontrol-events";
-
-function handleLlmRequest(payload: LlmRequest, process?: QcontrolProcess): void {
-  // payload.model, payload.system_instructions, ...
-}
-
-function handleInstallation(payload: InstallationRecord): void {
-  // payload.executable_path, payload.tap.status, ...
-}
-
-forward(event: QcontrolEvent, installation?: QcontrolInstallation, process?: QcontrolProcess): void {
-  switch (event.type) {
-    case "llm.request":
-      handleLlmRequest(event.payload, process); // event.payload is LlmRequest here
-      break;
-    case "installation.discovered":
-      handleInstallation(event.payload); // event.payload is InstallationRecord here
-      break;
-  }
-}
-```
-
-Unhandled event types fall through silently, so new qcontrol event types do not require code changes.
-
-The underlying types live in `src/types/qcontrol-events.ts` (`EventRecord`): the unified monitor consumer schema. Public-stream custom events arrive as `plugin.event`.
-
-`QcontrolProcess` carries qcontrol's `entity_id` plus the `process.started` payload fields. `tap.status` on an installation is `tapped`, `not_tapped`, or `requires_attention`.
-
-The file is published by qcontrol and updated together with the bundled qcontrol version; do not edit it by hand. `make update-qcontrol` downloads the binary and fetches the TypeScript types from `https://downloads.qpoint.io/qcontrol/docs/events/events.ts`.
-
-## Development
-
-Developer prerequisites:
-
-- Bun for dependency installation, tests, and compiled wrapper builds.
-- Make, if you use the repository Makefile.
-
-Install dependencies:
+This is only for exploring the example. Your app does not need this toolchain.
 
 ```sh
 bun install
-```
-
-Build the wrapper binary:
-
-```sh
-make build
-```
-
-`make build` ensures `bin/qcontrol.bin` exists, downloading qcontrol when needed, then compiles the wrapper to `bin/qctl`.
-On Windows, the download script fetches the upstream `qcontrol-latest-windows-x64.tgz` artifact and stores its `qcontrol.exe` payload at `bin\qcontrol.bin` for Bun to embed.
-
-Useful development commands:
-
-```sh
-bun run typecheck
-bun run test
-bun run dev -- --help
+make build          # downloads qcontrol if needed, compiles bin/qctl
 make update-qcontrol
-make pkg
-make clean
+bun test
+bun run typecheck
 ```
 
-`make pkg` packages the already-built `bin/qctl` into `dist/qctl-<version>-macos-arm64.pkg`. Inspect a built package with `scripts/macos-pkg/inspect.sh dist/qctl-<version>-macos-arm64.pkg`.
+`make update-qcontrol` refreshes both the bundled binary and the generated event types. `make pkg` (macOS) packages `bin/qctl` into `dist/`.
 
-During development, `bun run dev -- <args>` runs the wrapper from source.
+## License
 
-## Directories
-
-On first `qctl start` (or any command that launches qcontrol), qctl creates its own tree and seeds `config.toml` with a `[[sinks]]` entry for the collector:
-
-| Kind | macOS | Linux | Windows |
-|---|---|---|---|
-| Config | `~/.config/qctl/config.toml` | `~/.config/qctl/config.toml` | `%APPDATA%\qctl\config.toml` |
-| Data | `~/Library/Application Support/qctl` | `~/.local/share/qctl` | `%LOCALAPPDATA%\qctl` |
-| Cache | `~/Library/Caches/qctl` | `~/.cache/qctl` | `%LOCALAPPDATA%\qctl\cache` |
-| Collector | `{data}/collector.sock` | `{data}/collector.sock` | `pipe://qctl-collector` |
-
-Those paths are exported to qcontrol as `QCONTROL_CONFIG_DIR`, `QCONTROL_DATA_DIR`, and `QCONTROL_CACHE_DIR`. Existing `config.toml` files are left intact except for adding the collector sink if it is missing.
-
-## Running
-
-```sh
-make build
-./bin/qctl start        # background
-./bin/qctl start -f     # this terminal (pretty summaries)
-./bin/qctl start -f --raw
-./bin/qctl start --service
-./bin/qctl status
-./bin/qctl stop
-```
-
-`start` re-execs through sudo on macOS and Linux so `qcontrol start -f` can run elevated. `--service` must run from the compiled `qctl` binary. It registers a LaunchDaemon, systemd unit, or Windows service that runs `qctl start -f`. `qctl stop` unregisters that unit.
-
-## Configuration overrides
-
-The wrapper supports these environment variables for integration and deployment work:
-
-- `QCTL_CONFIG_DIR`: qctl config directory (contains `config.toml`). Passed to qcontrol as `QCONTROL_CONFIG_DIR`.
-- `QCTL_DATA_DIR`: qctl data directory (start pid, service marker, collector socket on POSIX). `QCTL_STATE_DIR` is accepted as an alias. Passed to qcontrol as `QCONTROL_DATA_DIR`.
-- `QCTL_CACHE_DIR`: qctl cache directory. `QCONTROL_WRAPPER_CACHE_DIR` is accepted as an alias. Passed to qcontrol as `QCONTROL_CACHE_DIR`.
-- `QCTL_SOCKET_PATH`: collector endpoint. On Windows, a short pipe name such as `qctl-collector` is normalized to `\\.\pipe\qctl-collector`.
-- `VERSION`: qcontrol version used by `scripts/download-qcontrol.sh`; defaults to `latest`.
-
-## Notes for template users
-
-The safest customization point is the forwarder implementation and its configuration. If the destination needs secrets or endpoints, load those inside the forwarder or pass them into the forwarder constructor from `runForeground()`.
+[MIT](LICENSE) © 2026 Qpoint, Inc.
